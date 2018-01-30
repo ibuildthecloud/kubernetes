@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,10 @@ package credentialprovider
 import (
 	"encoding/base64"
 	"fmt"
+	"reflect"
 	"testing"
+
+	dockertypes "github.com/docker/docker/api/types"
 )
 
 func TestUrlsMatch(t *testing.T) {
@@ -125,65 +128,77 @@ func TestDockerKeyringForGlob(t *testing.T) {
 		targetUrl string
 	}{
 		{
-			globUrl:   "hello.kubernetes.io",
+			globUrl:   "https://hello.kubernetes.io",
 			targetUrl: "hello.kubernetes.io",
 		},
 		{
-			globUrl:   "*.docker.io",
+			globUrl:   "https://*.docker.io",
 			targetUrl: "prefix.docker.io",
 		},
 		{
-			globUrl:   "prefix.*.io",
+			globUrl:   "https://prefix.*.io",
 			targetUrl: "prefix.docker.io",
 		},
 		{
-			globUrl:   "prefix.docker.*",
+			globUrl:   "https://prefix.docker.*",
 			targetUrl: "prefix.docker.io",
 		},
 		{
-			globUrl:   "*.docker.io/path",
+			globUrl:   "https://*.docker.io/path",
 			targetUrl: "prefix.docker.io/path",
 		},
 		{
-			globUrl:   "prefix.*.io/path",
+			globUrl:   "https://prefix.*.io/path",
 			targetUrl: "prefix.docker.io/path/subpath",
 		},
 		{
-			globUrl:   "prefix.docker.*/path",
+			globUrl:   "https://prefix.docker.*/path",
 			targetUrl: "prefix.docker.io/path",
 		},
 		{
-			globUrl:   "*.docker.io:8888",
+			globUrl:   "https://*.docker.io:8888",
 			targetUrl: "prefix.docker.io:8888",
 		},
 		{
-			globUrl:   "prefix.*.io:8888",
+			globUrl:   "https://prefix.*.io:8888",
 			targetUrl: "prefix.docker.io:8888",
 		},
 		{
-			globUrl:   "prefix.docker.*:8888",
+			globUrl:   "https://prefix.docker.*:8888",
 			targetUrl: "prefix.docker.io:8888",
 		},
 		{
-			globUrl:   "*.docker.io/path:1111",
+			globUrl:   "https://*.docker.io/path:1111",
 			targetUrl: "prefix.docker.io/path:1111",
 		},
 		{
-			globUrl:   "prefix.*.io/path:1111",
-			targetUrl: "prefix.docker.io/path/subpath:1111",
+			globUrl:   "https://*.docker.io/v1/",
+			targetUrl: "prefix.docker.io/path:1111",
 		},
 		{
-			globUrl:   "prefix.docker.*/path:1111",
+			globUrl:   "https://*.docker.io/v2/",
 			targetUrl: "prefix.docker.io/path:1111",
+		},
+		{
+			globUrl:   "https://prefix.docker.*/path:1111",
+			targetUrl: "prefix.docker.io/path:1111",
+		},
+		{
+			globUrl:   "prefix.docker.io:1111",
+			targetUrl: "prefix.docker.io:1111/path",
+		},
+		{
+			globUrl:   "*.docker.io:1111",
+			targetUrl: "prefix.docker.io:1111/path",
 		},
 	}
-	for _, test := range tests {
+	for i, test := range tests {
 		email := "foo@bar.baz"
 		username := "foo"
 		password := "bar"
 		auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 		sampleDockerConfig := fmt.Sprintf(`{
-   "https://%s": {
+   "%s": {
      "email": %q,
      "auth": %q
    }
@@ -198,8 +213,8 @@ func TestDockerKeyringForGlob(t *testing.T) {
 
 		creds, ok := keyring.Lookup(test.targetUrl + "/foo/bar")
 		if !ok {
-			t.Errorf("Didn't find expected URL: %s", test.targetUrl)
-			return
+			t.Errorf("%d: Didn't find expected URL: %s", i, test.targetUrl)
+			continue
 		}
 		val := creds[0]
 
@@ -221,19 +236,27 @@ func TestKeyringMiss(t *testing.T) {
 		lookupUrl string
 	}{
 		{
-			globUrl:   "hello.kubernetes.io",
+			globUrl:   "https://hello.kubernetes.io",
 			lookupUrl: "world.mesos.org/foo/bar",
 		},
 		{
-			globUrl:   "*.docker.com",
+			globUrl:   "https://*.docker.com",
 			lookupUrl: "prefix.docker.io",
+		},
+		{
+			globUrl:   "https://suffix.*.io",
+			lookupUrl: "prefix.docker.io",
+		},
+		{
+			globUrl:   "https://prefix.docker.c*",
+			lookupUrl: "prefix.docker.io",
+		},
+		{
+			globUrl:   "https://prefix.*.io/path:1111",
+			lookupUrl: "prefix.docker.io/path/subpath:1111",
 		},
 		{
 			globUrl:   "suffix.*.io",
-			lookupUrl: "prefix.docker.io",
-		},
-		{
-			globUrl:   "prefix.docker.c*",
 			lookupUrl: "prefix.docker.io",
 		},
 	}
@@ -243,7 +266,7 @@ func TestKeyringMiss(t *testing.T) {
 		password := "bar"
 		auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 		sampleDockerConfig := fmt.Sprintf(`{
-   "https://%s": {
+   "%s": {
      "email": %q,
      "auth": %q
    }
@@ -265,7 +288,7 @@ func TestKeyringMiss(t *testing.T) {
 }
 
 func TestKeyringMissWithDockerHubCredentials(t *testing.T) {
-	url := defaultRegistryHost
+	url := defaultRegistryKey
 	email := "foo@bar.baz"
 	username := "foo"
 	password := "bar"
@@ -291,7 +314,7 @@ func TestKeyringMissWithDockerHubCredentials(t *testing.T) {
 }
 
 func TestKeyringHitWithUnqualifiedDockerHub(t *testing.T) {
-	url := defaultRegistryHost
+	url := defaultRegistryKey
 	email := "foo@bar.baz"
 	username := "foo"
 	password := "bar"
@@ -332,7 +355,7 @@ func TestKeyringHitWithUnqualifiedDockerHub(t *testing.T) {
 }
 
 func TestKeyringHitWithUnqualifiedLibraryDockerHub(t *testing.T) {
-	url := defaultRegistryHost
+	url := defaultRegistryKey
 	email := "foo@bar.baz"
 	username := "foo"
 	password := "bar"
@@ -373,7 +396,7 @@ func TestKeyringHitWithUnqualifiedLibraryDockerHub(t *testing.T) {
 }
 
 func TestKeyringHitWithQualifiedDockerHub(t *testing.T) {
-	url := defaultRegistryHost
+	url := defaultRegistryKey
 	email := "foo@bar.baz"
 	username := "foo"
 	password := "bar"
@@ -442,6 +465,11 @@ func (d *testProvider) Enabled() bool {
 	return true
 }
 
+// LazyProvide implements dockerConfigProvider. Should never be called.
+func (d *testProvider) LazyProvide() *DockerConfigEntry {
+	return nil
+}
+
 // Provide implements dockerConfigProvider
 func (d *testProvider) Provide() DockerConfig {
 	d.Count += 1
@@ -472,5 +500,119 @@ func TestLazyKeyring(t *testing.T) {
 	lazy.Lookup("foo")
 	if provider.Count != 3 {
 		t.Errorf("Unexpected number of Provide calls: %v", provider.Count)
+	}
+}
+
+func TestDockerKeyringLookup(t *testing.T) {
+	ada := LazyAuthConfiguration{
+		AuthConfig: dockertypes.AuthConfig{
+			Username: "ada",
+			Password: "smash",
+			Email:    "ada@example.com",
+		},
+	}
+
+	grace := LazyAuthConfiguration{
+		AuthConfig: dockertypes.AuthConfig{
+			Username: "grace",
+			Password: "squash",
+			Email:    "grace@example.com",
+		},
+	}
+
+	dk := &BasicDockerKeyring{}
+	dk.Add(DockerConfig{
+		"bar.example.com/pong": DockerConfigEntry{
+			Username: grace.Username,
+			Password: grace.Password,
+			Email:    grace.Email,
+		},
+		"bar.example.com": DockerConfigEntry{
+			Username: ada.Username,
+			Password: ada.Password,
+			Email:    ada.Email,
+		},
+	})
+
+	tests := []struct {
+		image string
+		match []LazyAuthConfiguration
+		ok    bool
+	}{
+		// direct match
+		{"bar.example.com", []LazyAuthConfiguration{ada}, true},
+
+		// direct match deeper than other possible matches
+		{"bar.example.com/pong", []LazyAuthConfiguration{grace, ada}, true},
+
+		// no direct match, deeper path ignored
+		{"bar.example.com/ping", []LazyAuthConfiguration{ada}, true},
+
+		// match first part of path token
+		{"bar.example.com/pongz", []LazyAuthConfiguration{grace, ada}, true},
+
+		// match regardless of sub-path
+		{"bar.example.com/pong/pang", []LazyAuthConfiguration{grace, ada}, true},
+
+		// no host match
+		{"example.com", []LazyAuthConfiguration{}, false},
+		{"foo.example.com", []LazyAuthConfiguration{}, false},
+	}
+
+	for i, tt := range tests {
+		match, ok := dk.Lookup(tt.image)
+		if tt.ok != ok {
+			t.Errorf("case %d: expected ok=%t, got %t", i, tt.ok, ok)
+		}
+
+		if !reflect.DeepEqual(tt.match, match) {
+			t.Errorf("case %d: expected match=%#v, got %#v", i, tt.match, match)
+		}
+	}
+}
+
+// This validates that dockercfg entries with a scheme and url path are properly matched
+// by images that only match the hostname.
+// NOTE: the above covers the case of a more specific match trumping just hostname.
+func TestIssue3797(t *testing.T) {
+	rex := LazyAuthConfiguration{
+		AuthConfig: dockertypes.AuthConfig{
+			Username: "rex",
+			Password: "tiny arms",
+			Email:    "rex@example.com",
+		},
+	}
+
+	dk := &BasicDockerKeyring{}
+	dk.Add(DockerConfig{
+		"https://quay.io/v1/": DockerConfigEntry{
+			Username: rex.Username,
+			Password: rex.Password,
+			Email:    rex.Email,
+		},
+	})
+
+	tests := []struct {
+		image string
+		match []LazyAuthConfiguration
+		ok    bool
+	}{
+		// direct match
+		{"quay.io", []LazyAuthConfiguration{rex}, true},
+
+		// partial matches
+		{"quay.io/foo", []LazyAuthConfiguration{rex}, true},
+		{"quay.io/foo/bar", []LazyAuthConfiguration{rex}, true},
+	}
+
+	for i, tt := range tests {
+		match, ok := dk.Lookup(tt.image)
+		if tt.ok != ok {
+			t.Errorf("case %d: expected ok=%t, got %t", i, tt.ok, ok)
+		}
+
+		if !reflect.DeepEqual(tt.match, match) {
+			t.Errorf("case %d: expected match=%#v, got %#v", i, tt.match, match)
+		}
 	}
 }

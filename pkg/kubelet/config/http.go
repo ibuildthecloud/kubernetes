@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,32 +24,38 @@ import (
 	"net/http"
 	"time"
 
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/kubelet"
-	"k8s.io/kubernetes/pkg/util"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 
 	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type sourceURL struct {
 	url         string
 	header      http.Header
-	nodeName    string
+	nodeName    types.NodeName
 	updates     chan<- interface{}
 	data        []byte
 	failureLogs int
+	client      *http.Client
 }
 
-func NewSourceURL(url string, header http.Header, nodeName string, period time.Duration, updates chan<- interface{}) {
+func NewSourceURL(url string, header http.Header, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
 	config := &sourceURL{
 		url:      url,
 		header:   header,
 		nodeName: nodeName,
 		updates:  updates,
 		data:     nil,
+		// Timing out requests leads to retries. This client is only used to
+		// read the manifest URL passed to kubelet.
+		client: &http.Client{Timeout: 10 * time.Second},
 	}
 	glog.V(1).Infof("Watching URL %s", url)
-	go util.Until(config.run, period, util.NeverStop)
+	go wait.Until(config.run, period, wait.NeverStop)
 }
 
 func (s *sourceURL) run() {
@@ -59,7 +65,9 @@ func (s *sourceURL) run() {
 		if s.failureLogs < 3 {
 			glog.Warningf("Failed to read pods from URL: %v", err)
 		} else if s.failureLogs == 3 {
-			glog.Warningf("Failed to read pods from URL. Won't log this message anymore: %v", err)
+			glog.Warningf("Failed to read pods from URL. Dropping verbosity of this message to V(4): %v", err)
+		} else {
+			glog.V(4).Infof("Failed to read pods from URL: %v", err)
 		}
 		s.failureLogs++
 	} else {
@@ -80,8 +88,7 @@ func (s *sourceURL) extractFromURL() error {
 		return err
 	}
 	req.Header = s.header
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -90,12 +97,12 @@ func (s *sourceURL) extractFromURL() error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%v: %v", s.url, resp.Status)
 	}
 	if len(data) == 0 {
 		// Emit an update with an empty PodList to allow HTTPSource to be marked as seen
-		s.updates <- kubelet.PodUpdate{Pods: []*api.Pod{}, Op: kubelet.SET, Source: kubelet.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return fmt.Errorf("zero-length data received from %v", s.url)
 	}
 	// Short circuit if the data has not changed since the last time it was read.
@@ -111,7 +118,7 @@ func (s *sourceURL) extractFromURL() error {
 			// It parsed but could not be used.
 			return singlePodErr
 		}
-		s.updates <- kubelet.PodUpdate{Pods: []*api.Pod{pod}, Op: kubelet.SET, Source: kubelet.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{pod}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return nil
 	}
 
@@ -122,11 +129,11 @@ func (s *sourceURL) extractFromURL() error {
 			// It parsed but could not be used.
 			return multiPodErr
 		}
-		pods := make([]*api.Pod, 0)
+		pods := make([]*v1.Pod, 0)
 		for i := range podList.Items {
 			pods = append(pods, &podList.Items[i])
 		}
-		s.updates <- kubelet.PodUpdate{Pods: pods, Op: kubelet.SET, Source: kubelet.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return nil
 	}
 

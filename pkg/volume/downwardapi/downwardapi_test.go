@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,639 +23,371 @@ import (
 	"path"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/client/unversioned/testclient"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/kubernetes/pkg/fieldpath"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/empty_dir"
+	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
 
-const basePath = "/tmp/fake"
+const (
+	downwardAPIDir = "..data"
+	testPodUID     = types.UID("test_pod_uid")
+	testNamespace  = "test_metadata_namespace"
+	testName       = "test_metadata_name"
+)
 
-func formatMap(m map[string]string) (fmtstr string) {
-	for key, value := range m {
-		fmtstr += fmt.Sprintf("%v=%q\n", key, value)
-	}
-
-	return
-}
-
-func newTestHost(t *testing.T, client client.Interface) volume.VolumeHost {
-	tempDir, err := ioutil.TempDir(basePath, "downwardApi_volume_test.")
+func newTestHost(t *testing.T, clientset clientset.Interface) (string, volume.VolumeHost) {
+	tempDir, err := utiltesting.MkTmpdir("downwardApi_volume_test.")
 	if err != nil {
 		t.Fatalf("can't make a temp rootdir: %v", err)
 	}
-	return volume.NewFakeVolumeHost(tempDir, client, empty_dir.ProbeVolumePlugins())
+	return tempDir, volumetest.NewFakeVolumeHost(tempDir, clientset, empty_dir.ProbeVolumePlugins())
 }
 
 func TestCanSupport(t *testing.T) {
 	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, nil))
+	tmpDir, host := newTestHost(t, nil)
+	defer os.RemoveAll(tmpDir)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 
 	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
 	if err != nil {
 		t.Errorf("Can't find the plugin by name")
 	}
-	if plugin.Name() != downwardAPIPluginName {
-		t.Errorf("Wrong name: %s", plugin.Name())
+	if plugin.GetPluginName() != downwardAPIPluginName {
+		t.Errorf("Wrong name: %s", plugin.GetPluginName())
 	}
 }
 
-func CleanEverything(plugin volume.VolumePlugin, testVolumeName, volumePath string, testPodUID types.UID, t *testing.T) {
-	cleaner, err := plugin.NewCleaner(testVolumeName, testPodUID)
-	if err != nil {
-		t.Errorf("Failed to make a new Cleaner: %v", err)
-	}
-	if cleaner == nil {
-		t.Errorf("Got a nil Cleaner")
-	}
-
-	if err := cleaner.TearDown(); err != nil {
-		t.Errorf("Expected success, got: %v", err)
-	}
-	if _, err := os.Stat(volumePath); err == nil {
-		t.Errorf("TearDown() failed, volume path still exists: %s", volumePath)
-	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
-	}
-}
-
-func TestLabels(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_labels"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	labels := map[string]string{
+func TestDownwardAPI(t *testing.T) {
+	labels1 := map[string]string{
 		"key1": "value1",
-		"key2": "value2"}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
-			Labels:    labels,
-		},
-	})
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "labels", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.labels"}}}},
-		},
+		"key2": "value2",
 	}
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+	labels2 := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
 	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Labels: labels}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "labels"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-	if sortLines(string(data)) != sortLines(formatMap(labels)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(labels))
-	}
-
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-}
-
-func TestAnnotations(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_annotations"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
 	annotations := map[string]string{
 		"a1": "value1",
-		"a2": "value2"}
-
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "annotations", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.annotations"}}}},
+		"a2": "value2",
+	}
+	testCases := []struct {
+		name           string
+		files          map[string]string
+		modes          map[string]int32
+		podLabels      map[string]string
+		podAnnotations map[string]string
+		steps          []testStep
+	}{
+		{
+			name:      "test_labels",
+			files:     map[string]string{"labels": "metadata.labels"},
+			podLabels: labels1,
+			steps: []testStep{
+				// for steps that involve files, stepName is also
+				// used as the name of the file to verify
+				verifyMapInFile{stepName{"labels"}, labels1},
+			},
 		},
-	}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:        testName,
-			Namespace:   testNamespace,
-			Annotations: annotations,
+		{
+			name:           "test_annotations",
+			files:          map[string]string{"annotations": "metadata.annotations"},
+			podAnnotations: annotations,
+			steps: []testStep{
+				verifyMapInFile{stepName{"annotations"}, annotations},
+			},
 		},
-	})
-
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Annotations: annotations}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "annotations"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
-	if sortLines(string(data)) != sortLines(formatMap(annotations)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(annotations))
-	}
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-
-}
-
-func TestName(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_name"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "name_file_name", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.name"}}}},
+		{
+			name:  "test_name",
+			files: map[string]string{"name_file_name": "metadata.name"},
+			steps: []testStep{
+				verifyLinesInFile{stepName{"name_file_name"}, testName},
+			},
 		},
-	}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
+		{
+			name:  "test_namespace",
+			files: map[string]string{"namespace_file_name": "metadata.namespace"},
+			steps: []testStep{
+				verifyLinesInFile{stepName{"namespace_file_name"}, testNamespace},
+			},
 		},
-	})
-
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Name: testName}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "name_file_name"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
-	if string(data) != testName {
-		t.Errorf("Found `%s` expected %s", string(data), testName)
-	}
-
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-
-}
-
-func TestNamespace(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_namespace"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "namespace_file_name", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.namespace"}}}},
+		{
+			name:      "test_write_twice_no_update",
+			files:     map[string]string{"labels": "metadata.labels"},
+			podLabels: labels1,
+			steps: []testStep{
+				reSetUp{stepName{"resetup"}, false, nil},
+				verifyMapInFile{stepName{"labels"}, labels1},
+			},
 		},
-	}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
+		{
+			name:      "test_write_twice_with_update",
+			files:     map[string]string{"labels": "metadata.labels"},
+			podLabels: labels1,
+			steps: []testStep{
+				reSetUp{stepName{"resetup"}, true, labels2},
+				verifyMapInFile{stepName{"labels"}, labels2},
+			},
 		},
-	})
-
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Namespace: testNamespace}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "namespace_file_name"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-	if string(data) != testNamespace {
-		t.Errorf("Found `%s` expected %s", string(data), testNamespace)
-	}
-
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-
-}
-
-func TestWriteTwiceNoUpdate(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_write_twice_no_update"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	labels := map[string]string{
-		"key1": "value1",
-		"key2": "value2"}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
-			Labels:    labels,
+		{
+			name: "test_write_with_unix_path",
+			files: map[string]string{
+				"these/are/my/labels":        "metadata.labels",
+				"these/are/your/annotations": "metadata.annotations",
+			},
+			podLabels:      labels1,
+			podAnnotations: annotations,
+			steps: []testStep{
+				verifyMapInFile{stepName{"these/are/my/labels"}, labels1},
+				verifyMapInFile{stepName{"these/are/your/annotations"}, annotations},
+			},
 		},
-	})
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "labels", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.labels"}}}},
+		{
+			name:      "test_write_with_two_consecutive_slashes_in_the_path",
+			files:     map[string]string{"this//labels": "metadata.labels"},
+			podLabels: labels1,
+			steps: []testStep{
+				verifyMapInFile{stepName{"this/labels"}, labels1},
+			},
 		},
-	}
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Labels: labels}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	// get the link of the link
-	var currentTarget string
-	if currentTarget, err = os.Readlink(path.Join(volumePath, downwardAPIDir)); err != nil {
-		t.Errorf(".current should be a link... %s\n", err.Error())
-	}
-
-	err = builder.SetUp() // now re-run Setup
-	if err != nil {
-		t.Errorf("Failed to re-setup volume: %v", err)
-	}
-
-	// get the link of the link
-	var currentTarget2 string
-	if currentTarget2, err = os.Readlink(path.Join(volumePath, downwardAPIDir)); err != nil {
-		t.Errorf(".current should be a link... %s\n", err.Error())
-	}
-
-	if currentTarget2 != currentTarget {
-		t.Errorf("No update between the two Setup... Target link should be the same %s %s\n", currentTarget, currentTarget2)
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "labels"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
-	if sortLines(string(data)) != sortLines(formatMap(labels)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(labels))
-	}
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-
-}
-
-func TestWriteTwiceWithUpdate(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_write_twice_with_update"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	labels := map[string]string{
-		"key1": "value1",
-		"key2": "value2"}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
-			Labels:    labels,
+		{
+			name:  "test_default_mode",
+			files: map[string]string{"name_file_name": "metadata.name"},
+			steps: []testStep{
+				verifyMode{stepName{"name_file_name"}, 0644},
+			},
 		},
-	})
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "labels", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.labels"}}}},
-		},
-	}
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Labels: labels}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	var currentTarget string
-	if currentTarget, err = os.Readlink(path.Join(volumePath, downwardAPIDir)); err != nil {
-		t.Errorf("labels file should be a link... %s\n", err.Error())
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "labels"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
-	if sortLines(string(data)) != sortLines(formatMap(labels)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(labels))
-	}
-
-	newLabels := map[string]string{
-		"key1": "value1",
-		"key2": "value2",
-		"key3": "value3"}
-
-	// Now update the labels
-	pod.ObjectMeta.Labels = newLabels
-	err = builder.SetUp() // now re-run Setup
-	if err != nil {
-		t.Errorf("Failed to re-setup volume: %v", err)
-	}
-
-	// get the link of the link
-	var currentTarget2 string
-	if currentTarget2, err = os.Readlink(path.Join(volumePath, downwardAPIDir)); err != nil {
-		t.Errorf(".current should be a link... %s\n", err.Error())
-	}
-
-	if currentTarget2 == currentTarget {
-		t.Errorf("Got and update between the two Setup... Target link should NOT be the same\n")
-	}
-
-	data, err = ioutil.ReadFile(path.Join(volumePath, "labels"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
-	if sortLines(string(data)) != sortLines(formatMap(newLabels)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(newLabels))
-	}
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-}
-
-func TestWriteWithUnixPath(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_write_with_unix_path"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	labels := map[string]string{
-		"key1": "value1",
-		"key2": "value2",
-		"key3": "value3\n"}
-
-	annotations := map[string]string{
-		"a1": "value1",
-		"a2": "value2"}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
-			Labels:    labels,
-		},
-	})
-
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{Path: "this/is/mine/labels", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.labels"}},
-					{Path: "this/is/yours/annotations", FieldRef: api.ObjectFieldSelector{
-						FieldPath: "metadata.annotations"}},
-				}}},
-	}
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Labels: labels, Annotations: annotations}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
-
-	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
-	}
-	if builder == nil {
-		t.Errorf("Got a nil Builder")
-	}
-
-	volumePath := builder.GetPath()
-	err = builder.SetUp()
-	if err != nil {
-		t.Errorf("Failed to setup volume: %v", err)
-	}
-
-	var data []byte
-	data, err = ioutil.ReadFile(path.Join(volumePath, "this/is/mine/labels"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-
-	if sortLines(string(data)) != sortLines(formatMap(labels)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(labels))
-	}
-
-	data, err = ioutil.ReadFile(path.Join(volumePath, "this/is/yours/annotations"))
-	if err != nil {
-		t.Errorf(err.Error())
-	}
-	if sortLines(string(data)) != sortLines(formatMap(annotations)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(annotations))
-	}
-	CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-}
-
-func TestWriteWithUnixPathBadPath(t *testing.T) {
-	var (
-		testPodUID     = types.UID("test_pod_uid")
-		testVolumeName = "test_write_with_unix_path"
-		testNamespace  = "test_metadata_namespace"
-		testName       = "test_metadata_name"
-	)
-
-	labels := map[string]string{
-		"key1": "value1",
-		"key2": "value2",
-	}
-
-	fake := testclient.NewSimpleFake(&api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      testName,
-			Namespace: testNamespace,
-			Labels:    labels,
-		},
-	})
-
-	pluginMgr := volume.VolumePluginMgr{}
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), newTestHost(t, fake))
-	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-
-	volumeSpec := &api.Volume{
-		Name: testVolumeName,
-		VolumeSource: api.VolumeSource{
-			DownwardAPI: &api.DownwardAPIVolumeSource{
-				Items: []api.DownwardAPIVolumeFile{
-					{
-						Path: "this//labels",
-						FieldRef: api.ObjectFieldSelector{
-							FieldPath: "metadata.labels",
-						},
-					},
-				},
+		{
+			name:  "test_item_mode",
+			files: map[string]string{"name_file_name": "metadata.name"},
+			modes: map[string]int32{"name_file_name": 0400},
+			steps: []testStep{
+				verifyMode{stepName{"name_file_name"}, 0400},
 			},
 		},
 	}
+	for _, testCase := range testCases {
+		test := newDownwardAPITest(t, testCase.name, testCase.files, testCase.podLabels, testCase.podAnnotations, testCase.modes)
+		for _, step := range testCase.steps {
+			test.t.Logf("Test case: %q Step: %q", testCase.name, step.getName())
+			step.run(test)
+		}
+		test.tearDown()
+	}
+}
 
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: testPodUID, Labels: labels}}
-	builder, err := plugin.NewBuilder(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
+type downwardAPITest struct {
+	t          *testing.T
+	name       string
+	plugin     volume.VolumePlugin
+	pod        *v1.Pod
+	mounter    volume.Mounter
+	volumePath string
+	rootDir    string
+}
+
+func newDownwardAPITest(t *testing.T, name string, volumeFiles, podLabels, podAnnotations map[string]string, modes map[string]int32) *downwardAPITest {
+	defaultMode := int32(0644)
+	var files []v1.DownwardAPIVolumeFile
+	for path, fieldPath := range volumeFiles {
+		file := v1.DownwardAPIVolumeFile{
+			Path: path,
+			FieldRef: &v1.ObjectFieldSelector{
+				FieldPath: fieldPath,
+			},
+		}
+		if mode, found := modes[path]; found {
+			file.Mode = &mode
+		}
+		files = append(files, file)
+	}
+	podMeta := metav1.ObjectMeta{
+		Name:        testName,
+		Namespace:   testNamespace,
+		Labels:      podLabels,
+		Annotations: podAnnotations,
+	}
+	clientset := fake.NewSimpleClientset(&v1.Pod{ObjectMeta: podMeta})
+
+	pluginMgr := volume.VolumePluginMgr{}
+	rootDir, host := newTestHost(t, clientset)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
+	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
 	if err != nil {
-		t.Fatalf("Failed to make a new Builder: %v", err)
-	} else if builder == nil {
-		t.Fatalf("Got a nil Builder")
+		t.Errorf("Can't find the plugin by name")
 	}
 
-	volumePath := builder.GetPath()
-	defer CleanEverything(plugin, testVolumeName, volumePath, testPodUID, t)
-
-	err = builder.SetUp()
+	volumeSpec := &v1.Volume{
+		Name: name,
+		VolumeSource: v1.VolumeSource{
+			DownwardAPI: &v1.DownwardAPIVolumeSource{
+				DefaultMode: &defaultMode,
+				Items:       files,
+			},
+		},
+	}
+	podMeta.UID = testPodUID
+	pod := &v1.Pod{ObjectMeta: podMeta}
+	mounter, err := plugin.NewMounter(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
 	if err != nil {
-		t.Fatalf("Failed to setup volume: %v", err)
+		t.Errorf("Failed to make a new Mounter: %v", err)
+	}
+	if mounter == nil {
+		t.Fatalf("Got a nil Mounter")
 	}
 
-	data, err := ioutil.ReadFile(path.Join(volumePath, "this/labels"))
+	volumePath := mounter.GetPath()
+
+	err = mounter.SetUp(nil)
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Errorf("Failed to setup volume: %v", err)
 	}
 
-	if sortLines(string(data)) != sortLines(formatMap(labels)) {
-		t.Errorf("Found `%s` expected %s", data, formatMap(labels))
+	// downwardAPI volume should create its own empty wrapper path
+	podWrapperMetadataDir := fmt.Sprintf("%v/pods/%v/plugins/kubernetes.io~empty-dir/wrapped_%v", rootDir, testPodUID, name)
+
+	if _, err := os.Stat(podWrapperMetadataDir); err != nil {
+		if os.IsNotExist(err) {
+			t.Errorf("SetUp() failed, empty-dir wrapper path was not created: %s", podWrapperMetadataDir)
+		} else {
+			t.Errorf("SetUp() failed: %v", err)
+		}
+	}
+
+	return &downwardAPITest{
+		t:          t,
+		plugin:     plugin,
+		pod:        pod,
+		mounter:    mounter,
+		volumePath: volumePath,
+		rootDir:    rootDir,
+	}
+}
+
+func (test *downwardAPITest) tearDown() {
+	unmounter, err := test.plugin.NewUnmounter(test.name, testPodUID)
+	if err != nil {
+		test.t.Errorf("Failed to make a new Unmounter: %v", err)
+	}
+	if unmounter == nil {
+		test.t.Fatalf("Got a nil Unmounter")
+	}
+
+	if err := unmounter.TearDown(); err != nil {
+		test.t.Errorf("Expected success, got: %v", err)
+	}
+	if _, err := os.Stat(test.volumePath); err == nil {
+		test.t.Errorf("TearDown() failed, volume path still exists: %s", test.volumePath)
+	} else if !os.IsNotExist(err) {
+		test.t.Errorf("SetUp() failed: %v", err)
+	}
+	os.RemoveAll(test.rootDir)
+}
+
+// testStep represents a named step of downwardAPITest.
+// For steps that deal with files, step name also serves
+// as the name of the file that's used by the step.
+type testStep interface {
+	getName() string
+	run(*downwardAPITest)
+}
+
+type stepName struct {
+	name string
+}
+
+func (step stepName) getName() string { return step.name }
+
+func doVerifyLinesInFile(t *testing.T, volumePath, filename string, expected string) {
+	data, err := ioutil.ReadFile(path.Join(volumePath, filename))
+	if err != nil {
+		t.Errorf(err.Error())
+		return
+	}
+	actualStr := sortLines(string(data))
+	expectedStr := sortLines(expected)
+	if actualStr != expectedStr {
+		t.Errorf("Found `%s`, expected `%s`", actualStr, expectedStr)
+	}
+}
+
+type verifyLinesInFile struct {
+	stepName
+	expected string
+}
+
+func (step verifyLinesInFile) run(test *downwardAPITest) {
+	doVerifyLinesInFile(test.t, test.volumePath, step.name, step.expected)
+}
+
+type verifyMapInFile struct {
+	stepName
+	expected map[string]string
+}
+
+func (step verifyMapInFile) run(test *downwardAPITest) {
+	doVerifyLinesInFile(test.t, test.volumePath, step.name, fieldpath.FormatMap(step.expected))
+}
+
+type verifyMode struct {
+	stepName
+	expectedMode int32
+}
+
+func (step verifyMode) run(test *downwardAPITest) {
+	fileInfo, err := os.Stat(path.Join(test.volumePath, step.name))
+	if err != nil {
+		test.t.Errorf(err.Error())
+		return
+	}
+
+	actualMode := fileInfo.Mode()
+	expectedMode := os.FileMode(step.expectedMode)
+	if actualMode != expectedMode {
+		test.t.Errorf("Found mode `%v` expected %v", actualMode, expectedMode)
+	}
+}
+
+type reSetUp struct {
+	stepName
+	linkShouldChange bool
+	newLabels        map[string]string
+}
+
+func (step reSetUp) run(test *downwardAPITest) {
+	if step.newLabels != nil {
+		test.pod.ObjectMeta.Labels = step.newLabels
+	}
+
+	currentTarget, err := os.Readlink(path.Join(test.volumePath, downwardAPIDir))
+	if err != nil {
+		test.t.Errorf("labels file should be a link... %s\n", err.Error())
+	}
+
+	// now re-run Setup
+	if err = test.mounter.SetUp(nil); err != nil {
+		test.t.Errorf("Failed to re-setup volume: %v", err)
+	}
+
+	// get the link of the link
+	currentTarget2, err := os.Readlink(path.Join(test.volumePath, downwardAPIDir))
+	if err != nil {
+		test.t.Errorf(".current should be a link... %s\n", err.Error())
+	}
+
+	switch {
+	case step.linkShouldChange && currentTarget2 == currentTarget:
+		test.t.Errorf("Got and update between the two Setup... Target link should NOT be the same\n")
+	case !step.linkShouldChange && currentTarget2 != currentTarget:
+		test.t.Errorf("No update between the two Setup... Target link should be the same %s %s\n",
+			currentTarget, currentTarget2)
 	}
 }

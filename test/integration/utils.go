@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,78 +17,48 @@ limitations under the License.
 package integration
 
 import (
-	"fmt"
-	"math/rand"
-	"net/http"
-	"net/http/httptest"
 	"testing"
+	"time"
 
-	"k8s.io/kubernetes/pkg/api/latest"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/apiserver"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/master"
-	"k8s.io/kubernetes/pkg/tools/etcdtest"
-	"k8s.io/kubernetes/plugin/pkg/admission/admit"
-
-	"github.com/coreos/go-etcd/etcd"
-	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	clientset "k8s.io/client-go/kubernetes"
+	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
-func newEtcdClient() *etcd.Client {
-	return etcd.NewClient([]string{})
-}
-
-func requireEtcd() {
-	if _, err := newEtcdClient().Get("/", false, false); err != nil {
-		glog.Fatalf("unable to connect to etcd for integration testing: %v", err)
+func DeletePodOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
+	if err := c.Core().Pods(ns).Delete(name, nil); err != nil {
+		t.Errorf("unable to delete pod %v: %v", name, err)
 	}
 }
 
-func withEtcdKey(f func(string)) {
-	prefix := fmt.Sprintf("/test-%d", rand.Int63())
-	defer newEtcdClient().Delete(prefix, true)
-	f(prefix)
-}
+// Requests to try.  Each one should be forbidden or not forbidden
+// depending on the authentication and authorization setup of the master.
+var Code200 = map[int]bool{200: true}
+var Code201 = map[int]bool{201: true}
+var Code400 = map[int]bool{400: true}
+var Code401 = map[int]bool{401: true}
+var Code403 = map[int]bool{403: true}
+var Code404 = map[int]bool{404: true}
+var Code405 = map[int]bool{405: true}
+var Code409 = map[int]bool{409: true}
+var Code422 = map[int]bool{422: true}
+var Code500 = map[int]bool{500: true}
+var Code503 = map[int]bool{503: true}
 
-func deleteAllEtcdKeys() {
-	client := newEtcdClient()
-	keys, err := client.Get("/", false, false)
-	if err != nil {
-		glog.Fatalf("Unable to list root etcd keys: %v", err)
-	}
-	for _, node := range keys.Node.Nodes {
-		if _, err := client.Delete(node.Key, true); err != nil {
-			glog.Fatalf("Unable delete key: %v", err)
+// WaitForPodToDisappear polls the API server if the pod has been deleted.
+func WaitForPodToDisappear(podClient coreclient.PodInterface, podName string, interval, timeout time.Duration) error {
+	return wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := podClient.Get(podName, metav1.GetOptions{})
+		if err == nil {
+			return false, nil
+		} else {
+			if errors.IsNotFound(err) {
+				return true, nil
+			} else {
+				return false, err
+			}
 		}
-	}
-
-}
-
-func runAMaster(t *testing.T) (*master.Master, *httptest.Server) {
-	etcdStorage, err := master.NewEtcdStorage(newEtcdClient(), latest.GroupOrDie("").InterfacesFor, testapi.Default.Version(), etcdtest.PathPrefix())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	storageDestinations := master.NewStorageDestinations()
-	storageDestinations.AddAPIGroup("", etcdStorage)
-
-	m := master.New(&master.Config{
-		StorageDestinations:   storageDestinations,
-		KubeletClient:         client.FakeKubeletClient{},
-		EnableCoreControllers: true,
-		EnableLogsSupport:     false,
-		EnableProfiling:       true,
-		EnableUISupport:       false,
-		APIPrefix:             "/api",
-		Authorizer:            apiserver.NewAlwaysAllowAuthorizer(),
-		AdmissionControl:      admit.NewAlwaysAdmit(),
-		StorageVersions:       map[string]string{"": testapi.Default.Version()},
 	})
-
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		m.Handler.ServeHTTP(w, req)
-	}))
-
-	return m, s
 }

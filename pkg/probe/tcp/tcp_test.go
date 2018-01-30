@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,71 +20,49 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"k8s.io/kubernetes/pkg/probe"
 )
 
-func containsAny(s string, substrs []string) bool {
-	for _, substr := range substrs {
-		if strings.Contains(s, substr) {
-			return true
-		}
-	}
-	return false
-}
-
 func TestTcpHealthChecker(t *testing.T) {
-	prober := New()
-	tests := []struct {
-		expectedStatus probe.Result
-		usePort        bool
-		expectError    bool
-		// Some errors are different depending on your system, make
-		// the test pass on all of them
-		accOutputs []string
-	}{
-		// The probe will be filled in below.  This is primarily testing that a connection is made.
-		{probe.Success, true, false, []string{""}},
-		{probe.Failure, false, false, []string{"unknown port", "Servname not supported for ai_socktype"}},
-	}
-
+	// Setup a test server that responds to probing correctly
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	u, err := url.Parse(server.URL)
+	tHost, tPortStr, err := net.SplitHostPort(server.Listener.Addr().String())
 	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
+		t.Errorf("unexpected error: %v", err)
 	}
-	host, port, err := net.SplitHostPort(u.Host)
+	tPort, err := strconv.Atoi(tPortStr)
 	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
+		t.Errorf("unexpected error: %v", err)
 	}
-	for _, test := range tests {
-		p, err := strconv.Atoi(port)
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
+
+	tests := []struct {
+		host string
+		port int
+
+		expectedStatus probe.Result
+		expectedError  error
+	}{
+		// A connection is made and probing would succeed
+		{tHost, tPort, probe.Success, nil},
+		// No connection can be made and probing would fail
+		{tHost, -1, probe.Failure, nil},
+	}
+
+	prober := New()
+	for i, tt := range tests {
+		status, _, err := prober.Probe(tt.host, tt.port, 1*time.Second)
+		if status != tt.expectedStatus {
+			t.Errorf("#%d: expected status=%v, get=%v", i, tt.expectedStatus, status)
 		}
-		if !test.usePort {
-			p = -1
-		}
-		status, output, err := prober.Probe(host, p, 1*time.Second)
-		if status != test.expectedStatus {
-			t.Errorf("expected: %v, got: %v", test.expectedStatus, status)
-		}
-		if err != nil && !test.expectError {
-			t.Errorf("unexpected error: %v", err)
-		}
-		if err == nil && test.expectError {
-			t.Errorf("unexpected non-error.")
-		}
-		if !containsAny(output, test.accOutputs) {
-			t.Errorf("expected one of %#v, got %s", test.accOutputs, output)
+		if err != tt.expectedError {
+			t.Errorf("#%d: expected error=%v, get=%v", i, tt.expectedError, err)
 		}
 	}
 }

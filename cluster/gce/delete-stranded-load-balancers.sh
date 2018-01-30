@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,14 +18,16 @@
 PROJECT=${PROJECT:-kubernetes-jenkins}
 REGION=${REGION:-us-central1}
 
-LIST=$(gcloud --project=${PROJECT} compute target-pools list | sed 1d | awk '{print $1}')
+LIST=$(gcloud --project=${PROJECT} compute target-pools list --format='value(name)')
 
 result=0
 for x in ${LIST}; do
     if ! gcloud compute --project=${PROJECT} target-pools get-health "${x}" --region=${REGION} 2>/dev/null >/dev/null; then
 	echo DELETING "${x}"
-	gcloud compute --project=kubernetes-jenkins forwarding-rules delete "${x}" --region=us-central1 -q
-	gcloud compute --project=kubernetes-jenkins target-pools delete "${x}" --region=us-central1 -q
+	gcloud compute --project=${PROJECT} firewall-rules delete "k8s-fw-${x}" -q
+	gcloud compute --project=${PROJECT} forwarding-rules delete "${x}" --region=${REGION} -q
+	gcloud compute --project=${PROJECT} addresses delete "${x}" --region=${REGION} -q
+	gcloud compute --project=${PROJECT} target-pools delete "${x}" --region=${REGION} -q
         result=1
     fi
 done

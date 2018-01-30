@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,172 +14,133 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package resourcequotacontroller
+package resourcequota
 
 import (
-	"strconv"
+	"strings"
 	"testing"
 
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
+	core "k8s.io/client-go/testing"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/client/unversioned/testclient"
-	"k8s.io/kubernetes/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/pkg/quota/generic"
+	"k8s.io/kubernetes/pkg/quota/install"
 )
 
-func getResourceList(cpu, memory string) api.ResourceList {
-	res := api.ResourceList{}
+func getResourceList(cpu, memory string) v1.ResourceList {
+	res := v1.ResourceList{}
 	if cpu != "" {
-		res[api.ResourceCPU] = resource.MustParse(cpu)
+		res[v1.ResourceCPU] = resource.MustParse(cpu)
 	}
 	if memory != "" {
-		res[api.ResourceMemory] = resource.MustParse(memory)
+		res[v1.ResourceMemory] = resource.MustParse(memory)
 	}
 	return res
 }
 
-func getResourceRequirements(requests, limits api.ResourceList) api.ResourceRequirements {
-	res := api.ResourceRequirements{}
+func getResourceRequirements(requests, limits v1.ResourceList) v1.ResourceRequirements {
+	res := v1.ResourceRequirements{}
 	res.Requests = requests
 	res.Limits = limits
 	return res
 }
 
-func validPod(name string, numContainers int, resources api.ResourceRequirements) *api.Pod {
-	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: name, Namespace: "test"},
-		Spec:       api.PodSpec{},
-	}
-	pod.Spec.Containers = make([]api.Container, 0, numContainers)
-	for i := 0; i < numContainers; i++ {
-		pod.Spec.Containers = append(pod.Spec.Containers, api.Container{
-			Image:     "foo:V" + strconv.Itoa(i),
-			Resources: resources,
-		})
-	}
-	return pod
-}
-
-func TestFilterQuotaPods(t *testing.T) {
-	pods := []api.Pod{
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-running"},
-			Status:     api.PodStatus{Phase: api.PodRunning},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-pending"},
-			Status:     api.PodStatus{Phase: api.PodPending},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-succeeded"},
-			Status:     api.PodStatus{Phase: api.PodSucceeded},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-unknown"},
-			Status:     api.PodStatus{Phase: api.PodUnknown},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-failed"},
-			Status:     api.PodStatus{Phase: api.PodFailed},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-failed-with-restart-always"},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyAlways,
-			},
-			Status: api.PodStatus{Phase: api.PodFailed},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-failed-with-restart-on-failure"},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyOnFailure,
-			},
-			Status: api.PodStatus{Phase: api.PodFailed},
-		},
-		{
-			ObjectMeta: api.ObjectMeta{Name: "pod-failed-with-restart-never"},
-			Spec: api.PodSpec{
-				RestartPolicy: api.RestartPolicyNever,
-			},
-			Status: api.PodStatus{Phase: api.PodFailed},
-		},
-	}
-	expectedResults := sets.NewString("pod-running",
-		"pod-pending", "pod-unknown", "pod-failed-with-restart-always",
-		"pod-failed-with-restart-on-failure")
-
-	actualResults := sets.String{}
-	result := FilterQuotaPods(pods)
-	for i := range result {
-		actualResults.Insert(result[i].Name)
-	}
-
-	if len(expectedResults) != len(actualResults) || !actualResults.HasAll(expectedResults.List()...) {
-		t.Errorf("Expected results %v, Actual results %v", expectedResults, actualResults)
-	}
-}
-
 func TestSyncResourceQuota(t *testing.T) {
-	podList := api.PodList{
-		Items: []api.Pod{
+	podList := v1.PodList{
+		Items: []v1.Pod{
 			{
-				ObjectMeta: api.ObjectMeta{Name: "pod-running"},
-				Status:     api.PodStatus{Phase: api.PodRunning},
-				Spec: api.PodSpec{
-					Volumes:    []api.Volume{{Name: "vol"}},
-					Containers: []api.Container{{Name: "ctr", Image: "image", Resources: getResourceRequirements(getResourceList("100m", "1Gi"), getResourceList("", ""))}},
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-running", Namespace: "testing"},
+				Status:     v1.PodStatus{Phase: v1.PodRunning},
+				Spec: v1.PodSpec{
+					Volumes:    []v1.Volume{{Name: "vol"}},
+					Containers: []v1.Container{{Name: "ctr", Image: "image", Resources: getResourceRequirements(getResourceList("100m", "1Gi"), getResourceList("", ""))}},
 				},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{Name: "pod-running-2"},
-				Status:     api.PodStatus{Phase: api.PodRunning},
-				Spec: api.PodSpec{
-					Volumes:    []api.Volume{{Name: "vol"}},
-					Containers: []api.Container{{Name: "ctr", Image: "image", Resources: getResourceRequirements(getResourceList("100m", "1Gi"), getResourceList("", ""))}},
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-running-2", Namespace: "testing"},
+				Status:     v1.PodStatus{Phase: v1.PodRunning},
+				Spec: v1.PodSpec{
+					Volumes:    []v1.Volume{{Name: "vol"}},
+					Containers: []v1.Container{{Name: "ctr", Image: "image", Resources: getResourceRequirements(getResourceList("100m", "1Gi"), getResourceList("", ""))}},
 				},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{Name: "pod-failed"},
-				Status:     api.PodStatus{Phase: api.PodFailed},
-				Spec: api.PodSpec{
-					Volumes:    []api.Volume{{Name: "vol"}},
-					Containers: []api.Container{{Name: "ctr", Image: "image", Resources: getResourceRequirements(getResourceList("100m", "1Gi"), getResourceList("", ""))}},
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-failed", Namespace: "testing"},
+				Status:     v1.PodStatus{Phase: v1.PodFailed},
+				Spec: v1.PodSpec{
+					Volumes:    []v1.Volume{{Name: "vol"}},
+					Containers: []v1.Container{{Name: "ctr", Image: "image", Resources: getResourceRequirements(getResourceList("100m", "1Gi"), getResourceList("", ""))}},
 				},
 			},
 		},
 	}
-	quota := api.ResourceQuota{
-		Spec: api.ResourceQuotaSpec{
-			Hard: api.ResourceList{
-				api.ResourceCPU:    resource.MustParse("3"),
-				api.ResourceMemory: resource.MustParse("100Gi"),
-				api.ResourcePods:   resource.MustParse("5"),
+	resourceQuota := v1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "quota", Namespace: "testing"},
+		Spec: v1.ResourceQuotaSpec{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("3"),
+				v1.ResourceMemory: resource.MustParse("100Gi"),
+				v1.ResourcePods:   resource.MustParse("5"),
 			},
 		},
 	}
-	expectedUsage := api.ResourceQuota{
-		Status: api.ResourceQuotaStatus{
-			Hard: api.ResourceList{
-				api.ResourceCPU:    resource.MustParse("3"),
-				api.ResourceMemory: resource.MustParse("100Gi"),
-				api.ResourcePods:   resource.MustParse("5"),
+	expectedUsage := v1.ResourceQuota{
+		Status: v1.ResourceQuotaStatus{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("3"),
+				v1.ResourceMemory: resource.MustParse("100Gi"),
+				v1.ResourcePods:   resource.MustParse("5"),
 			},
-			Used: api.ResourceList{
-				api.ResourceCPU:    resource.MustParse("200m"),
-				api.ResourceMemory: resource.MustParse("2Gi"),
-				api.ResourcePods:   resource.MustParse("2"),
+			Used: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("200m"),
+				v1.ResourceMemory: resource.MustParse("2Gi"),
+				v1.ResourcePods:   resource.MustParse("2"),
 			},
 		},
 	}
 
-	kubeClient := testclient.NewSimpleFake(&podList, &quota)
-
-	ResourceQuotaController := NewResourceQuotaController(kubeClient)
-	err := ResourceQuotaController.syncResourceQuota(quota)
+	kubeClient := fake.NewSimpleClientset(&podList, &resourceQuota)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
+	resourceQuotaControllerOptions := &ResourceQuotaControllerOptions{
+		QuotaClient:           kubeClient.Core(),
+		ResourceQuotaInformer: informerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:          controller.NoResyncPeriodFunc,
+		Registry:              install.NewRegistry(kubeClient, nil),
+		GroupKindsToReplenish: []schema.GroupKind{
+			api.Kind("Pod"),
+			api.Kind("Service"),
+			api.Kind("ReplicationController"),
+			api.Kind("PersistentVolumeClaim"),
+		},
+		ControllerFactory:         NewReplenishmentControllerFactory(informerFactory),
+		ReplenishmentResyncPeriod: controller.NoResyncPeriodFunc,
+	}
+	quotaController := NewResourceQuotaController(resourceQuotaControllerOptions)
+	err := quotaController.syncResourceQuota(&resourceQuota)
 	if err != nil {
 		t.Fatalf("Unexpected error %v", err)
 	}
+	expectedActionSet := sets.NewString(
+		strings.Join([]string{"list", "pods", ""}, "-"),
+		strings.Join([]string{"update", "resourcequotas", "status"}, "-"),
+	)
+	actionSet := sets.NewString()
+	for _, action := range kubeClient.Actions() {
+		actionSet.Insert(strings.Join([]string{action.GetVerb(), action.GetResource().Resource, action.GetSubresource()}, "-"))
+	}
+	if !actionSet.HasAll(expectedActionSet.List()...) {
+		t.Errorf("Expected actions:\n%v\n but got:\n%v\nDifference:\n%v", expectedActionSet, actionSet, expectedActionSet.Difference(actionSet))
+	}
 
-	usage := kubeClient.Actions()[1].(testclient.UpdateAction).GetObject().(*api.ResourceQuota)
+	lastActionIndex := len(kubeClient.Actions()) - 1
+	usage := kubeClient.Actions()[lastActionIndex].(core.UpdateAction).GetObject().(*v1.ResourceQuota)
 
 	// ensure hard and used limits are what we expected
 	for k, v := range expectedUsage.Status.Hard {
@@ -201,42 +162,73 @@ func TestSyncResourceQuota(t *testing.T) {
 }
 
 func TestSyncResourceQuotaSpecChange(t *testing.T) {
-	quota := api.ResourceQuota{
-		Spec: api.ResourceQuotaSpec{
-			Hard: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("4"),
+	resourceQuota := v1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "rq",
+		},
+		Spec: v1.ResourceQuotaSpec{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
 			},
 		},
-		Status: api.ResourceQuotaStatus{
-			Hard: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("3"),
+		Status: v1.ResourceQuotaStatus{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("3"),
 			},
-			Used: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("0"),
-			},
-		},
-	}
-
-	expectedUsage := api.ResourceQuota{
-		Status: api.ResourceQuotaStatus{
-			Hard: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("4"),
-			},
-			Used: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("0"),
+			Used: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("0"),
 			},
 		},
 	}
 
-	kubeClient := testclient.NewSimpleFake(&quota)
+	expectedUsage := v1.ResourceQuota{
+		Status: v1.ResourceQuotaStatus{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
+			},
+			Used: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("0"),
+			},
+		},
+	}
 
-	ResourceQuotaController := NewResourceQuotaController(kubeClient)
-	err := ResourceQuotaController.syncResourceQuota(quota)
+	kubeClient := fake.NewSimpleClientset(&resourceQuota)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
+	resourceQuotaControllerOptions := &ResourceQuotaControllerOptions{
+		QuotaClient:           kubeClient.Core(),
+		ResourceQuotaInformer: informerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:          controller.NoResyncPeriodFunc,
+		Registry:              install.NewRegistry(kubeClient, nil),
+		GroupKindsToReplenish: []schema.GroupKind{
+			api.Kind("Pod"),
+			api.Kind("Service"),
+			api.Kind("ReplicationController"),
+			api.Kind("PersistentVolumeClaim"),
+		},
+		ControllerFactory:         NewReplenishmentControllerFactory(informerFactory),
+		ReplenishmentResyncPeriod: controller.NoResyncPeriodFunc,
+	}
+	quotaController := NewResourceQuotaController(resourceQuotaControllerOptions)
+	err := quotaController.syncResourceQuota(&resourceQuota)
 	if err != nil {
 		t.Fatalf("Unexpected error %v", err)
 	}
 
-	usage := kubeClient.Actions()[1].(testclient.UpdateAction).GetObject().(*api.ResourceQuota)
+	expectedActionSet := sets.NewString(
+		strings.Join([]string{"list", "pods", ""}, "-"),
+		strings.Join([]string{"update", "resourcequotas", "status"}, "-"),
+	)
+	actionSet := sets.NewString()
+	for _, action := range kubeClient.Actions() {
+		actionSet.Insert(strings.Join([]string{action.GetVerb(), action.GetResource().Resource, action.GetSubresource()}, "-"))
+	}
+	if !actionSet.HasAll(expectedActionSet.List()...) {
+		t.Errorf("Expected actions:\n%v\n but got:\n%v\nDifference:\n%v", expectedActionSet, actionSet, expectedActionSet.Difference(actionSet))
+	}
+
+	lastActionIndex := len(kubeClient.Actions()) - 1
+	usage := kubeClient.Actions()[lastActionIndex].(core.UpdateAction).GetObject().(*v1.ResourceQuota)
 
 	// ensure hard and used limits are what we expected
 	for k, v := range expectedUsage.Status.Hard {
@@ -257,183 +249,317 @@ func TestSyncResourceQuotaSpecChange(t *testing.T) {
 	}
 
 }
-
-func TestSyncResourceQuotaNoChange(t *testing.T) {
-	quota := api.ResourceQuota{
-		Spec: api.ResourceQuotaSpec{
-			Hard: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("4"),
+func TestSyncResourceQuotaSpecHardChange(t *testing.T) {
+	resourceQuota := v1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "rq",
+		},
+		Spec: v1.ResourceQuotaSpec{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
 			},
 		},
-		Status: api.ResourceQuotaStatus{
-			Hard: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("4"),
+		Status: v1.ResourceQuotaStatus{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("3"),
+				v1.ResourceMemory: resource.MustParse("1Gi"),
 			},
-			Used: api.ResourceList{
-				api.ResourceCPU: resource.MustParse("0"),
+			Used: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("0"),
+				v1.ResourceMemory: resource.MustParse("0"),
 			},
 		},
 	}
 
-	kubeClient := testclient.NewSimpleFake(&api.PodList{}, &quota)
+	expectedUsage := v1.ResourceQuota{
+		Status: v1.ResourceQuotaStatus{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
+			},
+			Used: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("0"),
+			},
+		},
+	}
 
-	ResourceQuotaController := NewResourceQuotaController(kubeClient)
-	err := ResourceQuotaController.syncResourceQuota(quota)
+	kubeClient := fake.NewSimpleClientset(&resourceQuota)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
+	resourceQuotaControllerOptions := &ResourceQuotaControllerOptions{
+		QuotaClient:           kubeClient.Core(),
+		ResourceQuotaInformer: informerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:          controller.NoResyncPeriodFunc,
+		Registry:              install.NewRegistry(kubeClient, nil),
+		GroupKindsToReplenish: []schema.GroupKind{
+			api.Kind("Pod"),
+			api.Kind("Service"),
+			api.Kind("ReplicationController"),
+			api.Kind("PersistentVolumeClaim"),
+		},
+		ControllerFactory:         NewReplenishmentControllerFactory(informerFactory),
+		ReplenishmentResyncPeriod: controller.NoResyncPeriodFunc,
+	}
+	quotaController := NewResourceQuotaController(resourceQuotaControllerOptions)
+	err := quotaController.syncResourceQuota(&resourceQuota)
 	if err != nil {
 		t.Fatalf("Unexpected error %v", err)
 	}
 
-	actions := kubeClient.Actions()
-	if len(actions) != 1 && !actions[0].Matches("list", "pods") {
-		t.Errorf("SyncResourceQuota made an unexpected client action when state was not dirty: %v", kubeClient.Actions)
+	expectedActionSet := sets.NewString(
+		strings.Join([]string{"list", "pods", ""}, "-"),
+		strings.Join([]string{"update", "resourcequotas", "status"}, "-"),
+	)
+	actionSet := sets.NewString()
+	for _, action := range kubeClient.Actions() {
+		actionSet.Insert(strings.Join([]string{action.GetVerb(), action.GetResource().Resource, action.GetSubresource()}, "-"))
 	}
-}
+	if !actionSet.HasAll(expectedActionSet.List()...) {
+		t.Errorf("Expected actions:\n%v\n but got:\n%v\nDifference:\n%v", expectedActionSet, actionSet, expectedActionSet.Difference(actionSet))
+	}
 
-func TestPodHasRequests(t *testing.T) {
-	type testCase struct {
-		pod            *api.Pod
-		resourceName   api.ResourceName
-		expectedResult bool
+	lastActionIndex := len(kubeClient.Actions()) - 1
+	usage := kubeClient.Actions()[lastActionIndex].(core.UpdateAction).GetObject().(*v1.ResourceQuota)
+
+	// ensure hard and used limits are what we expected
+	for k, v := range expectedUsage.Status.Hard {
+		actual := usage.Status.Hard[k]
+		actualValue := actual.String()
+		expectedValue := v.String()
+		if expectedValue != actualValue {
+			t.Errorf("Usage Hard: Key: %v, Expected: %v, Actual: %v", k, expectedValue, actualValue)
+		}
 	}
-	testCases := []testCase{
-		{
-			pod:            validPod("request-cpu", 2, getResourceRequirements(getResourceList("100m", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceCPU,
-			expectedResult: true,
-		},
-		{
-			pod:            validPod("no-request-cpu", 2, getResourceRequirements(getResourceList("", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceCPU,
-			expectedResult: false,
-		},
-		{
-			pod:            validPod("request-zero-cpu", 2, getResourceRequirements(getResourceList("0", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceCPU,
-			expectedResult: false,
-		},
-		{
-			pod:            validPod("request-memory", 2, getResourceRequirements(getResourceList("", "2Mi"), getResourceList("", ""))),
-			resourceName:   api.ResourceMemory,
-			expectedResult: true,
-		},
-		{
-			pod:            validPod("no-request-memory", 2, getResourceRequirements(getResourceList("", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceMemory,
-			expectedResult: false,
-		},
-		{
-			pod:            validPod("request-zero-memory", 2, getResourceRequirements(getResourceList("", "0"), getResourceList("", ""))),
-			resourceName:   api.ResourceMemory,
-			expectedResult: false,
-		},
+	for k, v := range expectedUsage.Status.Used {
+		actual := usage.Status.Used[k]
+		actualValue := actual.String()
+		expectedValue := v.String()
+		if expectedValue != actualValue {
+			t.Errorf("Usage Used: Key: %v, Expected: %v, Actual: %v", k, expectedValue, actualValue)
+		}
 	}
-	for _, item := range testCases {
-		if actual := PodHasRequests(item.pod, item.resourceName); item.expectedResult != actual {
-			t.Errorf("Pod %s for resource %s expected %v actual %v", item.pod.Name, item.resourceName, item.expectedResult, actual)
+
+	// ensure usage hard and used are are synced with spec hard, not have dirty resource
+	for k, v := range usage.Status.Hard {
+		if k == v1.ResourceMemory {
+			t.Errorf("Unexpected Usage Hard: Key: %v, Value: %v", k, v.String())
+		}
+	}
+
+	for k, v := range usage.Status.Used {
+		if k == v1.ResourceMemory {
+			t.Errorf("Unexpected Usage Used: Key: %v, Value: %v", k, v.String())
 		}
 	}
 }
 
-func TestPodRequests(t *testing.T) {
-	type testCase struct {
-		pod            *api.Pod
-		resourceName   api.ResourceName
-		expectedResult string
-		expectedError  bool
-	}
-	testCases := []testCase{
-		{
-			pod:            validPod("request-cpu", 2, getResourceRequirements(getResourceList("100m", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceCPU,
-			expectedResult: "200m",
-			expectedError:  false,
+func TestSyncResourceQuotaNoChange(t *testing.T) {
+	resourceQuota := v1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "rq",
 		},
-		{
-			pod:            validPod("no-request-cpu", 2, getResourceRequirements(getResourceList("", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceCPU,
-			expectedResult: "",
-			expectedError:  true,
+		Spec: v1.ResourceQuotaSpec{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
+			},
 		},
-		{
-			pod:            validPod("request-zero-cpu", 2, getResourceRequirements(getResourceList("0", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceCPU,
-			expectedResult: "",
-			expectedError:  true,
-		},
-		{
-			pod:            validPod("request-memory", 2, getResourceRequirements(getResourceList("", "500Mi"), getResourceList("", ""))),
-			resourceName:   api.ResourceMemory,
-			expectedResult: "1000Mi",
-			expectedError:  false,
-		},
-		{
-			pod:            validPod("no-request-memory", 2, getResourceRequirements(getResourceList("", ""), getResourceList("", ""))),
-			resourceName:   api.ResourceMemory,
-			expectedResult: "",
-			expectedError:  true,
-		},
-		{
-			pod:            validPod("request-zero-memory", 2, getResourceRequirements(getResourceList("", "0"), getResourceList("", ""))),
-			resourceName:   api.ResourceMemory,
-			expectedResult: "",
-			expectedError:  true,
+		Status: v1.ResourceQuotaStatus{
+			Hard: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
+			},
+			Used: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("0"),
+			},
 		},
 	}
-	for _, item := range testCases {
-		actual, err := PodRequests(item.pod, item.resourceName)
-		if item.expectedError != (err != nil) {
-			t.Errorf("Unexpected error result for pod %s for resource %s expected error %v got %v", item.pod.Name, item.resourceName, item.expectedError, err)
-		}
-		if item.expectedResult != "" && (item.expectedResult != actual.String()) {
-			t.Errorf("Expected %s, Actual %s, pod %s for resource %s", item.expectedResult, actual.String(), item.pod.Name, item.resourceName)
-		}
+
+	kubeClient := fake.NewSimpleClientset(&v1.PodList{}, &resourceQuota)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
+	resourceQuotaControllerOptions := &ResourceQuotaControllerOptions{
+		QuotaClient:           kubeClient.Core(),
+		ResourceQuotaInformer: informerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:          controller.NoResyncPeriodFunc,
+		Registry:              install.NewRegistry(kubeClient, nil),
+		GroupKindsToReplenish: []schema.GroupKind{
+			api.Kind("Pod"),
+			api.Kind("Service"),
+			api.Kind("ReplicationController"),
+			api.Kind("PersistentVolumeClaim"),
+		},
+		ControllerFactory:         NewReplenishmentControllerFactory(informerFactory),
+		ReplenishmentResyncPeriod: controller.NoResyncPeriodFunc,
+	}
+	quotaController := NewResourceQuotaController(resourceQuotaControllerOptions)
+	err := quotaController.syncResourceQuota(&resourceQuota)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	expectedActionSet := sets.NewString(
+		strings.Join([]string{"list", "pods", ""}, "-"),
+	)
+	actionSet := sets.NewString()
+	for _, action := range kubeClient.Actions() {
+		actionSet.Insert(strings.Join([]string{action.GetVerb(), action.GetResource().Resource, action.GetSubresource()}, "-"))
+	}
+	if !actionSet.HasAll(expectedActionSet.List()...) {
+		t.Errorf("Expected actions:\n%v\n but got:\n%v\nDifference:\n%v", expectedActionSet, actionSet, expectedActionSet.Difference(actionSet))
 	}
 }
 
-func TestPodsRequests(t *testing.T) {
-	type testCase struct {
-		pods           []*api.Pod
-		resourceName   api.ResourceName
-		expectedResult string
+func TestAddQuota(t *testing.T) {
+	kubeClient := fake.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, controller.NoResyncPeriodFunc())
+	resourceQuotaControllerOptions := &ResourceQuotaControllerOptions{
+		QuotaClient:           kubeClient.Core(),
+		ResourceQuotaInformer: informerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:          controller.NoResyncPeriodFunc,
+		Registry:              install.NewRegistry(kubeClient, nil),
+		GroupKindsToReplenish: []schema.GroupKind{
+			api.Kind("Pod"),
+			api.Kind("ReplicationController"),
+			api.Kind("PersistentVolumeClaim"),
+		},
+		ControllerFactory:         NewReplenishmentControllerFactory(informerFactory),
+		ReplenishmentResyncPeriod: controller.NoResyncPeriodFunc,
 	}
-	testCases := []testCase{
+	quotaController := NewResourceQuotaController(resourceQuotaControllerOptions)
+
+	delete(quotaController.registry.(*generic.GenericRegistry).InternalEvaluators, api.Kind("Service"))
+
+	testCases := []struct {
+		name string
+
+		quota            *v1.ResourceQuota
+		expectedPriority bool
+	}{
 		{
-			pods: []*api.Pod{
-				validPod("request-cpu-1", 1, getResourceRequirements(getResourceList("100m", ""), getResourceList("", ""))),
-				validPod("request-cpu-2", 1, getResourceRequirements(getResourceList("1", ""), getResourceList("", ""))),
+			name:             "no status",
+			expectedPriority: true,
+			quota: &v1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "rq",
+				},
+				Spec: v1.ResourceQuotaSpec{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+				},
 			},
-			resourceName:   api.ResourceCPU,
-			expectedResult: "1100m",
 		},
 		{
-			pods: []*api.Pod{
-				validPod("no-request-cpu-1", 1, getResourceRequirements(getResourceList("", ""), getResourceList("", ""))),
-				validPod("no-request-cpu-2", 1, getResourceRequirements(getResourceList("", ""), getResourceList("", ""))),
+			name:             "status, no usage",
+			expectedPriority: true,
+			quota: &v1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "rq",
+				},
+				Spec: v1.ResourceQuotaSpec{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+				},
+				Status: v1.ResourceQuotaStatus{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+				},
 			},
-			resourceName:   api.ResourceCPU,
-			expectedResult: "",
 		},
 		{
-			pods: []*api.Pod{
-				validPod("request-zero-cpu-1", 1, getResourceRequirements(getResourceList("0", ""), getResourceList("", ""))),
-				validPod("request-zero-cpu-1", 1, getResourceRequirements(getResourceList("0", ""), getResourceList("", ""))),
+			name:             "status, mismatch",
+			expectedPriority: true,
+			quota: &v1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "rq",
+				},
+				Spec: v1.ResourceQuotaSpec{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+				},
+				Status: v1.ResourceQuotaStatus{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("6"),
+					},
+					Used: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("0"),
+					},
+				},
 			},
-			resourceName:   api.ResourceCPU,
-			expectedResult: "",
 		},
 		{
-			pods: []*api.Pod{
-				validPod("request-memory-1", 1, getResourceRequirements(getResourceList("", "500Mi"), getResourceList("", ""))),
-				validPod("request-memory-2", 1, getResourceRequirements(getResourceList("", "1Gi"), getResourceList("", ""))),
+			name:             "status, missing usage, but don't care",
+			expectedPriority: false,
+			quota: &v1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "rq",
+				},
+				Spec: v1.ResourceQuotaSpec{
+					Hard: v1.ResourceList{
+						v1.ResourceServices: resource.MustParse("4"),
+					},
+				},
+				Status: v1.ResourceQuotaStatus{
+					Hard: v1.ResourceList{
+						v1.ResourceServices: resource.MustParse("4"),
+					},
+				},
 			},
-			resourceName:   api.ResourceMemory,
-			expectedResult: "1524Mi",
+		},
+		{
+			name:             "ready",
+			expectedPriority: false,
+			quota: &v1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "rq",
+				},
+				Spec: v1.ResourceQuotaSpec{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+				},
+				Status: v1.ResourceQuotaStatus{
+					Hard: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+					Used: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("0"),
+					},
+				},
+			},
 		},
 	}
-	for _, item := range testCases {
-		actual := PodsRequests(item.pods, item.resourceName)
-		if item.expectedResult != "" && (item.expectedResult != actual.String()) {
-			t.Errorf("Expected %s, Actual %s, pod %s for resource %s", item.expectedResult, actual.String(), item.pods[0].Name, item.resourceName)
+
+	for _, tc := range testCases {
+		quotaController.addQuota(tc.quota)
+		if tc.expectedPriority {
+			if e, a := 1, quotaController.missingUsageQueue.Len(); e != a {
+				t.Errorf("%s: expected %v, got %v", tc.name, e, a)
+			}
+			if e, a := 0, quotaController.queue.Len(); e != a {
+				t.Errorf("%s: expected %v, got %v", tc.name, e, a)
+			}
+		} else {
+			if e, a := 0, quotaController.missingUsageQueue.Len(); e != a {
+				t.Errorf("%s: expected %v, got %v", tc.name, e, a)
+			}
+			if e, a := 1, quotaController.queue.Len(); e != a {
+				t.Errorf("%s: expected %v, got %v", tc.name, e, a)
+			}
+		}
+
+		for quotaController.missingUsageQueue.Len() > 0 {
+			key, _ := quotaController.missingUsageQueue.Get()
+			quotaController.missingUsageQueue.Done(key)
+		}
+		for quotaController.queue.Len() > 0 {
+			key, _ := quotaController.queue.Get()
+			quotaController.queue.Done(key)
 		}
 	}
 }

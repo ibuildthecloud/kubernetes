@@ -1,7 +1,7 @@
 // +build linux
 
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,13 @@ limitations under the License.
 package mount
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/utils/exec"
 )
 
 // NsenterMounter is part of experimental support for running the kubelet
@@ -50,7 +51,7 @@ import (
 //     contents. TODO: remove this requirement.
 // 6.  The host image must have mount, findmnt, and umount binaries in /bin,
 //     /usr/sbin, or /usr/bin
-//
+// 7.  The host image should have systemd-run in /bin, /usr/sbin, or /usr/bin
 // For more information about mount propagation modes, see:
 //   https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt
 type NsenterMounter struct {
@@ -61,9 +62,10 @@ type NsenterMounter struct {
 func NewNsenterMounter() *NsenterMounter {
 	m := &NsenterMounter{
 		paths: map[string]string{
-			"mount":   "",
-			"findmnt": "",
-			"umount":  "",
+			"mount":       "",
+			"findmnt":     "",
+			"umount":      "",
+			"systemd-run": "",
 		},
 	}
 	// search for the mount command in other locations besides /usr/bin
@@ -79,6 +81,7 @@ func NewNsenterMounter() *NsenterMounter {
 			break
 		}
 		// TODO: error, so that the kubelet can stop if the mounts don't exist
+		// (don't forget that systemd-run is optional)
 	}
 	return m
 }
@@ -87,9 +90,11 @@ func NewNsenterMounter() *NsenterMounter {
 var _ = Interface(&NsenterMounter{})
 
 const (
-	hostRootFsPath     = "/rootfs"
-	hostProcMountsPath = "/rootfs/proc/mounts"
-	nsenterPath        = "nsenter"
+	hostRootFsPath         = "/rootfs"
+	hostProcMountsPath     = "/rootfs/proc/1/mounts"
+	hostProcMountinfoPath  = "/rootfs/proc/1/mountinfo"
+	hostMountNamespacePath = "/rootfs/proc/1/ns/mnt"
+	nsenterPath            = "nsenter"
 )
 
 // Mount runs mount(8) in the host's root mount namespace.  Aside from this
@@ -118,7 +123,7 @@ func (n *NsenterMounter) doNsenterMount(source, target, fstype string, options [
 	exec := exec.New()
 	outputBytes, err := exec.Command(nsenterPath, args...).CombinedOutput()
 	if len(outputBytes) != 0 {
-		glog.V(5).Infof("Output from mount command: %v", string(outputBytes))
+		glog.V(5).Infof("Output of mounting %s to %s: %v", source, target, string(outputBytes))
 	}
 
 	return err
@@ -127,31 +132,65 @@ func (n *NsenterMounter) doNsenterMount(source, target, fstype string, options [
 // makeNsenterArgs makes a list of argument to nsenter in order to do the
 // requested mount.
 func (n *NsenterMounter) makeNsenterArgs(source, target, fstype string, options []string) []string {
-	nsenterArgs := []string{
-		"--mount=/rootfs/proc/1/ns/mnt",
-		"--",
-		n.absHostPath("mount"),
+	mountCmd := n.absHostPath("mount")
+	mountArgs := makeMountArgs(source, target, fstype, options)
+
+	if systemdRunPath, hasSystemd := n.paths["systemd-run"]; hasSystemd {
+		// Complete command line:
+		// nsenter --mount=/rootfs/proc/1/ns/mnt -- /bin/systemd-run --description=... --scope -- /bin/mount -t <type> <what> <where>
+		// Expected flow is:
+		// * nsenter breaks out of container's mount namespace and executes
+		//   host's systemd-run.
+		// * systemd-run creates a transient scope (=~ cgroup) and executes its
+		//   argument (/bin/mount) there.
+		// * mount does its job, forks a fuse daemon if necessary and finishes.
+		//   (systemd-run --scope finishes at this point, returning mount's exit
+		//   code and stdout/stderr - thats one of --scope benefits).
+		// * systemd keeps the fuse daemon running in the scope (i.e. in its own
+		//   cgroup) until the fuse daemon dies (another --scope benefit).
+		//   Kubelet container can be restarted and the fuse daemon survives.
+		// * When the daemon dies (e.g. during unmount) systemd removes the
+		//   scope automatically.
+		mountCmd, mountArgs = addSystemdScope(systemdRunPath, target, mountCmd, mountArgs)
+	} else {
+		// Fall back to simple mount when the host has no systemd.
+		// Complete command line:
+		// nsenter --mount=/rootfs/proc/1/ns/mnt -- /bin/mount -t <type> <what> <where>
+		// Expected flow is:
+		// * nsenter breaks out of container's mount namespace and executes host's /bin/mount.
+		// * mount does its job, forks a fuse daemon if necessary and finishes.
+		// * Any fuse daemon runs in cgroup of kubelet docker container,
+		//   restart of kubelet container will kill it!
+
+		// No code here, mountCmd and mountArgs use /bin/mount
 	}
 
-	args := makeMountArgs(source, target, fstype, options)
+	nsenterArgs := []string{
+		"--mount=" + hostMountNamespacePath,
+		"--",
+		mountCmd,
+	}
+	nsenterArgs = append(nsenterArgs, mountArgs...)
 
-	return append(nsenterArgs, args...)
+	return nsenterArgs
 }
 
 // Unmount runs umount(8) in the host's mount namespace.
 func (n *NsenterMounter) Unmount(target string) error {
 	args := []string{
-		"--mount=/rootfs/proc/1/ns/mnt",
+		"--mount=" + hostMountNamespacePath,
 		"--",
 		n.absHostPath("umount"),
 		target,
 	}
-
+	// No need to execute systemd-run here, it's enough that unmount is executed
+	// in the host's mount namespace. It will finish appropriate fuse daemon(s)
+	// running in any scope.
 	glog.V(5).Infof("Unmount command: %v %v", nsenterPath, args)
 	exec := exec.New()
 	outputBytes, err := exec.Command(nsenterPath, args...).CombinedOutput()
 	if len(outputBytes) != 0 {
-		glog.V(5).Infof("Output from mount command: %v", string(outputBytes))
+		glog.V(5).Infof("Output of unmounting %s: %v", target, string(outputBytes))
 	}
 
 	return err
@@ -162,6 +201,15 @@ func (*NsenterMounter) List() ([]MountPoint, error) {
 	return listProcMounts(hostProcMountsPath)
 }
 
+func (m *NsenterMounter) IsNotMountPoint(dir string) (bool, error) {
+	return IsNotMountPoint(m, dir)
+}
+
+func (*NsenterMounter) IsMountPointMatch(mp MountPoint, dir string) bool {
+	deletedDir := fmt.Sprintf("%s\\040(deleted)", dir)
+	return ((mp.Path == dir) || (mp.Path == deletedDir))
+}
+
 // IsLikelyNotMountPoint determines whether a path is a mountpoint by calling findmnt
 // in the host's root mount namespace.
 func (n *NsenterMounter) IsLikelyNotMountPoint(file string) (bool, error) {
@@ -170,24 +218,71 @@ func (n *NsenterMounter) IsLikelyNotMountPoint(file string) (bool, error) {
 		return true, err
 	}
 
-	args := []string{"--mount=/rootfs/proc/1/ns/mnt", "--", n.absHostPath("findmnt"), "-o", "target", "--noheadings", "--target", file}
+	// Check the directory exists
+	if _, err = os.Stat(file); os.IsNotExist(err) {
+		glog.V(5).Infof("findmnt: directory %s does not exist", file)
+		return true, err
+	}
+	// Add --first-only option: since we are testing for the absence of a mountpoint, it is sufficient to get only
+	// the first of multiple possible mountpoints using --first-only.
+	// Also add fstype output to make sure that the output of target file will give the full path
+	// TODO: Need more refactoring for this function. Track the solution with issue #26996
+	args := []string{"--mount=" + hostMountNamespacePath, "--", n.absHostPath("findmnt"), "-o", "target,fstype", "--noheadings", "--first-only", "--target", file}
 	glog.V(5).Infof("findmnt command: %v %v", nsenterPath, args)
 
 	exec := exec.New()
 	out, err := exec.Command(nsenterPath, args...).CombinedOutput()
 	if err != nil {
-		// If the command itself is correct, then if we encountered error
-		// then most likely this means that the directory does not exist.
-		return true, os.ErrNotExist
+		glog.V(2).Infof("Failed findmnt command for path %s: %v", file, err)
+		// Different operating systems behave differently for paths which are not mount points.
+		// On older versions (e.g. 2.20.1) we'd get error, on newer ones (e.g. 2.26.2) we'd get "/".
+		// It's safer to assume that it's not a mount point.
+		return true, nil
 	}
-	strOut := strings.TrimSuffix(string(out), "\n")
+	mountTarget, err := parseFindMnt(string(out))
+	if err != nil {
+		return false, err
+	}
 
-	glog.V(5).Infof("IsLikelyNotMountPoint findmnt output: %v", strOut)
-	if strOut == file {
+	glog.V(5).Infof("IsLikelyNotMountPoint findmnt output for path %s: %v:", file, mountTarget)
+
+	if mountTarget == file {
+		glog.V(5).Infof("IsLikelyNotMountPoint: %s is a mount point", file)
 		return false, nil
 	}
-
+	glog.V(5).Infof("IsLikelyNotMountPoint: %s is not a mount point", file)
 	return true, nil
+}
+
+// parse output of "findmnt -o target,fstype" and return just the target
+func parseFindMnt(out string) (string, error) {
+	// cut trailing newline
+	out = strings.TrimSuffix(out, "\n")
+	// cut everything after the last space - it's the filesystem type
+	i := strings.LastIndex(out, " ")
+	if i == -1 {
+		return "", fmt.Errorf("error parsing findmnt output, expected at least one space: %q", out)
+	}
+	return out[:i], nil
+}
+
+// DeviceOpened checks if block device in use by calling Open with O_EXCL flag.
+// Returns true if open returns errno EBUSY, and false if errno is nil.
+// Returns an error if errno is any error other than EBUSY.
+// Returns with error if pathname is not a device.
+func (n *NsenterMounter) DeviceOpened(pathname string) (bool, error) {
+	return exclusiveOpenFailsOnDevice(pathname)
+}
+
+// PathIsDevice uses FileInfo returned from os.Stat to check if path refers
+// to a device.
+func (n *NsenterMounter) PathIsDevice(pathname string) (bool, error) {
+	return pathIsDevice(pathname)
+}
+
+//GetDeviceNameFromMount given a mount point, find the volume id from checking /proc/mounts
+func (n *NsenterMounter) GetDeviceNameFromMount(mountPath, pluginDir string) (string, error) {
+	return getDeviceNameFromMount(n, mountPath, pluginDir)
 }
 
 func (n *NsenterMounter) absHostPath(command string) string {
@@ -196,4 +291,14 @@ func (n *NsenterMounter) absHostPath(command string) string {
 		return command
 	}
 	return path
+}
+
+func (n *NsenterMounter) MakeRShared(path string) error {
+	nsenterCmd := nsenterPath
+	nsenterArgs := []string{
+		"--mount=" + hostMountNamespacePath,
+		"--",
+		n.absHostPath("mount"),
+	}
+	return doMakeRShared(path, hostProcMountinfoPath, nsenterCmd, nsenterArgs)
 }

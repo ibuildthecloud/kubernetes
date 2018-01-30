@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/utils/exec"
+	fakeexec "k8s.io/utils/exec/testing"
 )
 
 func TestFindPairInterfaceOfContainerInterface(t *testing.T) {
@@ -53,22 +55,23 @@ func TestFindPairInterfaceOfContainerInterface(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		fcmd := exec.FakeCmd{
-			CombinedOutputScript: []exec.FakeCombinedOutputAction{
+		fcmd := fakeexec.FakeCmd{
+			CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
 				func() ([]byte, error) { return []byte(test.output), test.err },
 			},
 		}
-		fexec := exec.FakeExec{
-			CommandScript: []exec.FakeCommandAction{
+		fexec := fakeexec.FakeExec{
+			CommandScript: []fakeexec.FakeCommandAction{
 				func(cmd string, args ...string) exec.Cmd {
-					return exec.InitFakeCmd(&fcmd, cmd, args...)
+					return fakeexec.InitFakeCmd(&fcmd, cmd, args...)
 				},
 			},
 			LookPathFunc: func(file string) (string, error) {
 				return fmt.Sprintf("/fake-bin/%s", file), nil
 			},
 		}
-		name, err := findPairInterfaceOfContainerInterface(&fexec, 123, "eth0")
+		nsenterArgs := []string{"-t", "123", "-n"}
+		name, err := findPairInterfaceOfContainerInterface(&fexec, "eth0", "123", nsenterArgs)
 		if test.expectErr {
 			if err == nil {
 				t.Errorf("unexpected non-error")
@@ -84,13 +87,23 @@ func TestFindPairInterfaceOfContainerInterface(t *testing.T) {
 	}
 }
 
-func TestSetUpInterface(t *testing.T) {
+func TestSetUpInterfaceNonExistent(t *testing.T) {
 	err := setUpInterface("non-existent")
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
-	hairpinModeFile := fmt.Sprintf("%s/%s/%s", sysfsNetPath, "non-existent", hairpinModeRelativePath)
-	if !strings.Contains(fmt.Sprintf("%v", err), hairpinModeFile) {
-		t.Errorf("should have tried to open %s", hairpinModeFile)
+	deviceDir := fmt.Sprintf("%s/%s", sysfsNetPath, "non-existent")
+	if !strings.Contains(fmt.Sprintf("%v", err), deviceDir) {
+		t.Errorf("should have tried to open %s", deviceDir)
+	}
+}
+
+func TestSetUpInterfaceNotBridged(t *testing.T) {
+	err := setUpInterface("lo")
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("'lo' device does not exist??? (%v)", err)
+		}
+		t.Errorf("unexpected error: %v", err)
 	}
 }

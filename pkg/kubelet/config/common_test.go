@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,42 +20,44 @@ import (
 	"reflect"
 	"testing"
 
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/registered"
 	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/securitycontext"
-
-	"github.com/ghodss/yaml"
 )
 
 func noDefault(*api.Pod) error { return nil }
 
 func TestDecodeSinglePod(t *testing.T) {
 	grace := int64(30)
-	pod := &api.Pod{
-		TypeMeta: unversioned.TypeMeta{
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
 			APIVersion: "",
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			UID:       "12345",
 			Namespace: "mynamespace",
 		},
-		Spec: api.PodSpec{
-			RestartPolicy:                 api.RestartPolicyAlways,
-			DNSPolicy:                     api.DNSClusterFirst,
+		Spec: v1.PodSpec{
+			RestartPolicy:                 v1.RestartPolicyAlways,
+			DNSPolicy:                     v1.DNSClusterFirst,
 			TerminationGracePeriodSeconds: &grace,
-			Containers: []api.Container{{
-				Name:                   "image",
-				Image:                  "test/image",
-				ImagePullPolicy:        "IfNotPresent",
-				TerminationMessagePath: "/dev/termination-log",
-				SecurityContext:        securitycontext.ValidSecurityContextWithContainerDefaults(),
+			Containers: []v1.Container{{
+				Name:                     "image",
+				Image:                    "test/image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePath:   "/dev/termination-log",
+				TerminationMessagePolicy: v1.TerminationMessageReadFile,
+				SecurityContext:          securitycontext.ValidSecurityContextWithContainerDefaults(),
 			}},
+			SecurityContext: &v1.PodSecurityContext{},
+			SchedulerName:   api.DefaultSchedulerName,
 		},
 	}
-	json, err := testapi.Default.Codec().Encode(pod)
+	json, err := runtime.Encode(testapi.Default.Codec(), pod)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -70,16 +72,13 @@ func TestDecodeSinglePod(t *testing.T) {
 		t.Errorf("expected:\n%#v\ngot:\n%#v\n%s", pod, podOut, string(json))
 	}
 
-	for _, version := range registered.GroupVersionsForGroup("") {
-		externalPod, err := testapi.Default.Converter().ConvertToVersion(pod, version)
+	for _, gv := range api.Registry.EnabledVersionsForGroup(v1.GroupName) {
+		info, _ := runtime.SerializerInfoForMediaType(api.Codecs.SupportedMediaTypes(), "application/yaml")
+		encoder := api.Codecs.EncoderForVersion(info.Serializer, gv)
+		yaml, err := runtime.Encode(encoder, pod)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		yaml, err := yaml.Marshal(externalPod)
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-
 		parsed, podOut, err = tryDecodeSinglePod(yaml, noDefault)
 		if !parsed {
 			t.Errorf("expected to have parsed file: (%s)", string(yaml))
@@ -95,32 +94,36 @@ func TestDecodeSinglePod(t *testing.T) {
 
 func TestDecodePodList(t *testing.T) {
 	grace := int64(30)
-	pod := &api.Pod{
-		TypeMeta: unversioned.TypeMeta{
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
 			APIVersion: "",
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			UID:       "12345",
 			Namespace: "mynamespace",
 		},
-		Spec: api.PodSpec{
-			RestartPolicy:                 api.RestartPolicyAlways,
-			DNSPolicy:                     api.DNSClusterFirst,
+		Spec: v1.PodSpec{
+			RestartPolicy:                 v1.RestartPolicyAlways,
+			DNSPolicy:                     v1.DNSClusterFirst,
 			TerminationGracePeriodSeconds: &grace,
-			Containers: []api.Container{{
-				Name:                   "image",
-				Image:                  "test/image",
-				ImagePullPolicy:        "IfNotPresent",
-				TerminationMessagePath: "/dev/termination-log",
-				SecurityContext:        securitycontext.ValidSecurityContextWithContainerDefaults(),
+			Containers: []v1.Container{{
+				Name:                     "image",
+				Image:                    "test/image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePath:   "/dev/termination-log",
+				TerminationMessagePolicy: v1.TerminationMessageReadFile,
+
+				SecurityContext: securitycontext.ValidSecurityContextWithContainerDefaults(),
 			}},
+			SecurityContext: &v1.PodSecurityContext{},
+			SchedulerName:   api.DefaultSchedulerName,
 		},
 	}
-	podList := &api.PodList{
-		Items: []api.Pod{*pod},
+	podList := &v1.PodList{
+		Items: []v1.Pod{*pod},
 	}
-	json, err := testapi.Default.Codec().Encode(podList)
+	json, err := runtime.Encode(testapi.Default.Codec(), podList)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -135,25 +138,53 @@ func TestDecodePodList(t *testing.T) {
 		t.Errorf("expected:\n%#v\ngot:\n%#v\n%s", podList, &podListOut, string(json))
 	}
 
-	for _, version := range registered.GroupVersionsForGroup("") {
-		externalPodList, err := testapi.Default.Converter().ConvertToVersion(podList, version)
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		yaml, err := yaml.Marshal(externalPodList)
+	for _, gv := range api.Registry.EnabledVersionsForGroup(v1.GroupName) {
+		info, _ := runtime.SerializerInfoForMediaType(api.Codecs.SupportedMediaTypes(), "application/yaml")
+		encoder := api.Codecs.EncoderForVersion(info.Serializer, gv)
+		yaml, err := runtime.Encode(encoder, podList)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 
 		parsed, podListOut, err = tryDecodePodList(yaml, noDefault)
 		if !parsed {
-			t.Errorf("expected to have parsed file: (%s)", string(yaml))
+			t.Errorf("expected to have parsed file: (%s): %v", string(yaml), err)
+			continue
 		}
 		if err != nil {
 			t.Errorf("unexpected error: %v (%s)", err, string(yaml))
+			continue
 		}
 		if !reflect.DeepEqual(podList, &podListOut) {
 			t.Errorf("expected:\n%#v\ngot:\n%#v\n%s", pod, &podListOut, string(yaml))
+		}
+	}
+}
+
+func TestGetSelfLink(t *testing.T) {
+	var testCases = []struct {
+		desc             string
+		name             string
+		namespace        string
+		expectedSelfLink string
+	}{
+		{
+			desc:             "No namespace specified",
+			name:             "foo",
+			namespace:        "",
+			expectedSelfLink: "/api/v1/namespaces/default/pods/foo",
+		},
+		{
+			desc:             "Namespace specified",
+			name:             "foo",
+			namespace:        "bar",
+			expectedSelfLink: "/api/v1/namespaces/bar/pods/foo",
+		},
+	}
+	for _, testCase := range testCases {
+		selfLink := getSelfLink(testCase.name, testCase.namespace)
+		if testCase.expectedSelfLink != selfLink {
+			t.Errorf("%s: getSelfLink error, expected: %s, got: %s", testCase.desc, testCase.expectedSelfLink, selfLink)
 		}
 	}
 }

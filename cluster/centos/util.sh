@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 # exit on any error
 set -e
 
-SSH_OPTS="-oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oLogLevel=ERROR"
+SSH_OPTS="-oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oLogLevel=ERROR -C"
 
 # Use the config file specified in $KUBE_CONFIG_FILE, or default to
 # config-default.sh.
@@ -31,25 +31,29 @@ source "$KUBE_ROOT/cluster/common.sh"
 
 KUBECTL_PATH=${KUBE_ROOT}/cluster/centos/binaries/kubectl
 
-# Directory to be used for master and minion provisioning.
+# Directory to be used for master and node provisioning.
 KUBE_TEMP="~/kube_temp"
 
 
-# Must ensure that the following ENV vars are set
-function detect-master() {
-  KUBE_MASTER=$MASTER
-  KUBE_MASTER_IP=${MASTER#*@}
-  echo "KUBE_MASTER_IP: ${KUBE_MASTER_IP}" 1>&2
-  echo "KUBE_MASTER: ${MASTER}" 1>&2
+# Get master IP addresses and store in KUBE_MASTER_IP_ADDRESSES[]
+# Must ensure that the following ENV vars are set:
+#   MASTERS
+function detect-masters() {
+  KUBE_MASTER_IP_ADDRESSES=()
+  for master in ${MASTERS}; do
+    KUBE_MASTER_IP_ADDRESSES+=("${master#*@}")
+  done
+  echo "KUBE_MASTERS: ${MASTERS}" 1>&2
+  echo "KUBE_MASTER_IP_ADDRESSES: [${KUBE_MASTER_IP_ADDRESSES[*]}]" 1>&2
 }
 
-# Get minion IP addresses and store in KUBE_MINION_IP_ADDRESSES[]
-function detect-minions() {
-  KUBE_MINION_IP_ADDRESSES=()
-  for minion in ${MINIONS}; do
-    KUBE_MINION_IP_ADDRESSES+=("${minion#*@}")
+# Get node IP addresses and store in KUBE_NODE_IP_ADDRESSES[]
+function detect-nodes() {
+  KUBE_NODE_IP_ADDRESSES=()
+  for node in ${NODES}; do
+    KUBE_NODE_IP_ADDRESSES+=("${node#*@}")
   done
-  echo "KUBE_MINION_IP_ADDRESSES: [${KUBE_MINION_IP_ADDRESSES[*]}]" 1>&2
+  echo "KUBE_NODE_IP_ADDRESSES: [${KUBE_NODE_IP_ADDRESSES[*]}]" 1>&2
 }
 
 # Verify prereqs on host machine
@@ -96,27 +100,43 @@ function trap-add {
 function validate-cluster() {
   # by default call the generic validate-cluster.sh script, customizable by
   # any cluster provider if this does not fit.
+  set +e
   "${KUBE_ROOT}/cluster/validate-cluster.sh"
+  if [[ "$?" -ne "0" ]]; then
+    for master in ${MASTERS}; do
+      troubleshoot-master ${master}
+    done
+    for node in ${NODES}; do
+      troubleshoot-node ${node}
+    done
+    exit 1
+  fi
+  set -e
 }
 
 # Instantiate a kubernetes cluster
 function kube-up() {
-  provision-master
+  make-ca-cert
 
-  for minion in ${MINIONS}; do
-    provision-minion ${minion}
+  local num_infra=0
+  for master in ${MASTERS}; do
+    provision-master "${master}" "infra${num_infra}"
+    let ++num_infra
   done
 
-  verify-master
-  for minion in ${MINIONS}; do
-    verify-minion ${minion}
+  for master in ${MASTERS}; do
+    post-provision-master "${master}"
   done
 
-  detect-master
+  for node in ${NODES}; do
+    provision-node "${node}"
+  done
+
+  detect-masters
 
   # set CONTEXT and KUBE_SERVER values for create-kubeconfig() and get-password()
   export CONTEXT="centos"
-  export KUBE_SERVER="http://${KUBE_MASTER_IP}:8080"
+  export KUBE_SERVER="http://${MASTER_ADVERTISE_ADDRESS}:8080"
   source "${KUBE_ROOT}/cluster/common.sh"
 
   # set kubernetes user and password
@@ -126,88 +146,76 @@ function kube-up() {
 
 # Delete a kubernetes cluster
 function kube-down() {
-  tear-down-master
-  for minion in ${MINIONS}; do
-    tear-down-minion ${minion}
+  for master in ${MASTERS}; do
+    tear-down-master ${master}
+  done
+
+  for node in ${NODES}; do
+    tear-down-node ${node}
   done
 }
 
-
-function verify-master() {
-  # verify master has all required daemons
-  printf "[INFO] Validating master ${MASTER}"
+function troubleshoot-master() {
+  # Troubleshooting on master if all required daemons are active.
+  echo "[INFO] Troubleshooting on master $1"
   local -a required_daemon=("kube-apiserver" "kube-controller-manager" "kube-scheduler")
-  local validated="1"
-  local try_count=0
-  until [[ "$validated" == "0" ]]; do
-    validated="0"
-    local daemon
-    for daemon in "${required_daemon[@]}"; do
-      local rc=0
-      kube-ssh "${MASTER}" "sudo pgrep -f ${daemon}" >/dev/null 2>&1 || rc="$?"
-      if [[ "${rc}" -ne "0" ]]; then
-        printf "."
-        validated="1"
-        ((try_count=try_count+2))
-        if [[ ${try_count} -gt ${PROCESS_CHECK_TIMEOUT} ]]; then
-          printf "\nWarning: Process \"${daemon}\" failed to run on ${MASTER}, please check.\n"
-          exit 1
-        fi
-        sleep 2
-      fi
-    done
+  local daemon
+  local daemon_status
+  printf "%-24s %-10s \n" "PROCESS" "STATUS"
+  for daemon in "${required_daemon[@]}"; do
+    local rc=0
+    kube-ssh "${1}" "sudo systemctl is-active ${daemon}" >/dev/null 2>&1 || rc="$?"
+    if [[ "${rc}" -ne "0" ]]; then
+      daemon_status="inactive"
+    else
+      daemon_status="active"
+    fi
+    printf "%-24s %s\n" ${daemon} ${daemon_status}
   done
   printf "\n"
-
 }
 
-function verify-minion() {
-  # verify minion has all required daemons
-  printf "[INFO] Validating minion ${1}"
-  local -a required_daemon=("kube-proxy" "kubelet" "docker")
-  local validated="1"
-  local try_count=0
-  until [[ "$validated" == "0" ]]; do
-    validated="0"
-    local daemon
-    for daemon in "${required_daemon[@]}"; do
-      local rc=0
-      kube-ssh "${1}" "sudo pgrep -f ${daemon}" >/dev/null 2>&1 || rc="$?"
-      if [[ "${rc}" -ne "0" ]]; then
-        printf "."
-        validated="1"
-        ((try_count=try_count+2))
-        if [[ ${try_count} -gt ${PROCESS_CHECK_TIMEOUT} ]] ; then
-          printf "\nWarning: Process \"${daemon}\" failed to run on ${1}, please check.\n"
-          exit 1
-        fi
-        sleep 2
-      fi
-    done
+function troubleshoot-node() {
+  # Troubleshooting on node if all required daemons are active.
+  echo "[INFO] Troubleshooting on node ${1}"
+  local -a required_daemon=("kube-proxy" "kubelet" "docker" "flannel")
+  local daemon
+  local daemon_status
+  printf "%-24s %-10s \n" "PROCESS" "STATUS"
+  for daemon in "${required_daemon[@]}"; do
+    local rc=0
+    kube-ssh "${1}" "sudo systemctl is-active ${daemon}" >/dev/null 2>&1 || rc="$?"
+    if [[ "${rc}" -ne "0" ]]; then
+      daemon_status="inactive"
+    else
+      daemon_status="active"
+    fi
+    printf "%-24s %s\n" ${daemon} ${daemon_status}
   done
   printf "\n"
 }
 
 # Clean up on master
 function tear-down-master() {
-echo "[INFO] tear-down-master on ${MASTER}"
+echo "[INFO] tear-down-master on $1"
   for service_name in etcd kube-apiserver kube-controller-manager kube-scheduler ; do
       service_file="/usr/lib/systemd/system/${service_name}.service"
-      kube-ssh "$MASTER" " \
+      kube-ssh "$1" " \
         if [[ -f $service_file ]]; then \
           sudo systemctl stop $service_name; \
           sudo systemctl disable $service_name; \
           sudo rm -f $service_file; \
         fi"
   done
-  kube-ssh "${MASTER}" "sudo rm -rf /opt/kubernetes"
-  kube-ssh "${MASTER}" "sudo rm -rf ${KUBE_TEMP}"
-  kube-ssh "${MASTER}" "sudo rm -rf /var/lib/etcd"
+  kube-ssh "${1}" "sudo rm -rf /opt/kubernetes"
+  kube-ssh "${1}" "sudo rm -rf /srv/kubernetes"
+  kube-ssh "${1}" "sudo rm -rf ${KUBE_TEMP}"
+  kube-ssh "${1}" "sudo rm -rf /var/lib/etcd"
 }
 
-# Clean up on minion
-function tear-down-minion() {
-echo "[INFO] tear-down-minion on $1"
+# Clean up on node
+function tear-down-node() {
+echo "[INFO] tear-down-node on $1"
   for service_name in kube-proxy kubelet docker flannel ; do
       service_file="/usr/lib/systemd/system/${service_name}.service"
       kube-ssh "$1" " \
@@ -219,59 +227,104 @@ echo "[INFO] tear-down-minion on $1"
   done
   kube-ssh "$1" "sudo rm -rf /run/flannel"
   kube-ssh "$1" "sudo rm -rf /opt/kubernetes"
+  kube-ssh "$1" "sudo rm -rf /srv/kubernetes"
   kube-ssh "$1" "sudo rm -rf ${KUBE_TEMP}"
+}
+
+# Generate the CA certificates for k8s components
+function make-ca-cert() {
+  echo "[INFO] make-ca-cert"
+  bash "${ROOT}/../saltbase/salt/generate-cert/make-ca-cert.sh" "${MASTER_ADVERTISE_IP}" "IP:${MASTER_ADVERTISE_IP},IP:${SERVICE_CLUSTER_IP_RANGE%.*}.1,DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local"
 }
 
 # Provision master
 #
 # Assumed vars:
-#   MASTER
+#   $1 (master)
+#   $2 (etcd_name)
 #   KUBE_TEMP
 #   ETCD_SERVERS
+#   ETCD_INITIAL_CLUSTER
 #   SERVICE_CLUSTER_IP_RANGE
+#   MASTER_ADVERTISE_ADDRESS
 function provision-master() {
-  echo "[INFO] Provision master on ${MASTER}"
-  local master_ip=${MASTER#*@}
-  ensure-setup-dir ${MASTER}
+  echo "[INFO] Provision master on $1"
+  local master="$1"
+  local master_ip="${master#*@}"
+  local etcd_name="$2"
+  ensure-setup-dir "${master}"
+  ensure-etcd-cert "${etcd_name}" "${master_ip}"
 
-  # scp -r ${SSH_OPTS} master config-default.sh copy-files.sh util.sh "${MASTER}:${KUBE_TEMP}" 
-  kube-scp ${MASTER} "${ROOT}/../saltbase/salt/generate-cert/make-ca-cert.sh ${ROOT}/binaries/master ${ROOT}/master ${ROOT}/config-default.sh ${ROOT}/util.sh" "${KUBE_TEMP}" 
-  kube-ssh "${MASTER}" " \
+  kube-scp "${master}" "${ROOT}/ca-cert ${ROOT}/binaries/master ${ROOT}/master ${ROOT}/config-default.sh ${ROOT}/util.sh" "${KUBE_TEMP}"
+  kube-scp "${master}" "${ROOT}/etcd-cert/ca.pem \
+    ${ROOT}/etcd-cert/client.pem \
+    ${ROOT}/etcd-cert/client-key.pem \
+    ${ROOT}/etcd-cert/server-${etcd_name}.pem \
+    ${ROOT}/etcd-cert/server-${etcd_name}-key.pem \
+    ${ROOT}/etcd-cert/peer-${etcd_name}.pem \
+    ${ROOT}/etcd-cert/peer-${etcd_name}-key.pem" "${KUBE_TEMP}/etcd-cert"
+  kube-ssh "${master}" " \
+    sudo rm -rf /opt/kubernetes/bin; \
     sudo cp -r ${KUBE_TEMP}/master/bin /opt/kubernetes; \
+    sudo mkdir -p /srv/kubernetes/; sudo cp -f ${KUBE_TEMP}/ca-cert/* /srv/kubernetes/; \
+    sudo mkdir -p /srv/kubernetes/etcd; sudo cp -f ${KUBE_TEMP}/etcd-cert/* /srv/kubernetes/etcd/; \
     sudo chmod -R +x /opt/kubernetes/bin; \
-    sudo bash ${KUBE_TEMP}/make-ca-cert.sh ${master_ip} IP:${master_ip},IP:${SERVICE_CLUSTER_IP_RANGE%.*}.1,DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local; \
-    sudo bash ${KUBE_TEMP}/master/scripts/etcd.sh; \
+    sudo ln -sf /opt/kubernetes/bin/* /usr/local/bin/; \
+    sudo bash ${KUBE_TEMP}/master/scripts/etcd.sh ${etcd_name} ${master_ip} ${ETCD_INITIAL_CLUSTER}; \
     sudo bash ${KUBE_TEMP}/master/scripts/apiserver.sh ${master_ip} ${ETCD_SERVERS} ${SERVICE_CLUSTER_IP_RANGE} ${ADMISSION_CONTROL}; \
-    sudo bash ${KUBE_TEMP}/master/scripts/controller-manager.sh ${master_ip}; \
-    sudo bash ${KUBE_TEMP}/master/scripts/scheduler.sh ${master_ip}"
+    sudo bash ${KUBE_TEMP}/master/scripts/controller-manager.sh ${MASTER_ADVERTISE_ADDRESS}; \
+    sudo bash ${KUBE_TEMP}/master/scripts/scheduler.sh ${MASTER_ADVERTISE_ADDRESS}"
 }
 
-
-# Provision minion
+# Post-provision master, run after all masters were provisioned
 #
 # Assumed vars:
-#   $1 (minion)
-#   MASTER
+#   $1 (master)
 #   KUBE_TEMP
 #   ETCD_SERVERS
 #   FLANNEL_NET
-#   DOCKER_OPTS
-function provision-minion() {
-  echo "[INFO] Provision minion on $1"
-  local master_ip=${MASTER#*@}
-  local minion=$1
-  local minion_ip=${minion#*@}
-  ensure-setup-dir ${minion}
+function post-provision-master() {
+  echo "[INFO] Post provision master on $1"
+  local master=$1
+  kube-ssh "${master}" " \
+    sudo bash ${KUBE_TEMP}/master/scripts/flannel.sh ${ETCD_SERVERS} ${FLANNEL_NET}; \
+    sudo bash ${KUBE_TEMP}/master/scripts/post-etcd.sh"
+}
 
-  # scp -r ${SSH_OPTS} minion config-default.sh copy-files.sh util.sh "${minion_ip}:${KUBE_TEMP}" 
-  kube-scp ${minion} "${ROOT}/binaries/node ${ROOT}/node ${ROOT}/config-default.sh ${ROOT}/util.sh" ${KUBE_TEMP}
-  kube-ssh "${minion}" " \
+# Provision node
+#
+# Assumed vars:
+#   $1 (node)
+#   KUBE_TEMP
+#   ETCD_SERVERS
+#   FLANNEL_NET
+#   MASTER_ADVERTISE_ADDRESS
+#   DOCKER_OPTS
+#   DNS_SERVER_IP
+#   DNS_DOMAIN
+function provision-node() {
+  echo "[INFO] Provision node on $1"
+  local node=$1
+  local node_ip=${node#*@}
+  local dns_ip=${DNS_SERVER_IP#*@}
+  local dns_domain=${DNS_DOMAIN#*@}
+  ensure-setup-dir ${node}
+
+  kube-scp "${node}" "${ROOT}/binaries/node ${ROOT}/node ${ROOT}/config-default.sh ${ROOT}/util.sh" "${KUBE_TEMP}"
+  kube-scp "${node}" "${ROOT}/etcd-cert/ca.pem \
+    ${ROOT}/etcd-cert/client.pem \
+    ${ROOT}/etcd-cert/client-key.pem" "${KUBE_TEMP}/etcd-cert"
+  kube-ssh "${node}" " \
+    rm -rf /opt/kubernetes/bin; \
     sudo cp -r ${KUBE_TEMP}/node/bin /opt/kubernetes; \
     sudo chmod -R +x /opt/kubernetes/bin; \
+    sudo mkdir -p /srv/kubernetes/etcd; sudo cp -f ${KUBE_TEMP}/etcd-cert/* /srv/kubernetes/etcd/; \
+    sudo ln -s /opt/kubernetes/bin/* /usr/local/bin/; \
+    sudo mkdir -p /srv/kubernetes/etcd; sudo cp -f ${KUBE_TEMP}/etcd-cert/* /srv/kubernetes/etcd/; \
     sudo bash ${KUBE_TEMP}/node/scripts/flannel.sh ${ETCD_SERVERS} ${FLANNEL_NET}; \
     sudo bash ${KUBE_TEMP}/node/scripts/docker.sh \"${DOCKER_OPTS}\"; \
-    sudo bash ${KUBE_TEMP}/node/scripts/kubelet.sh ${master_ip} ${minion_ip}; \
-    sudo bash ${KUBE_TEMP}/node/scripts/proxy.sh ${master_ip}"
+    sudo bash ${KUBE_TEMP}/node/scripts/kubelet.sh ${MASTER_ADVERTISE_ADDRESS} ${node_ip} ${dns_ip} ${dns_domain}; \
+    sudo bash ${KUBE_TEMP}/node/scripts/proxy.sh ${MASTER_ADVERTISE_ADDRESS}"
 }
 
 # Create dirs that'll be used during setup on target machine.
@@ -280,8 +333,27 @@ function provision-minion() {
 #   KUBE_TEMP
 function ensure-setup-dir() {
   kube-ssh "${1}" "mkdir -p ${KUBE_TEMP}; \
+                   mkdir -p ${KUBE_TEMP}/etcd-cert; \
                    sudo mkdir -p /opt/kubernetes/bin; \
                    sudo mkdir -p /opt/kubernetes/cfg"
+}
+
+# Generate certificates for etcd cluster
+#
+# Assumed vars:
+#   $1 (etcd member name)
+#   $2 (master ip)
+function ensure-etcd-cert() {
+  local etcd_name="$1"
+  local master_ip="$2"
+  local cert_dir="${ROOT}/etcd-cert"
+
+  if [[ ! -r "${cert_dir}/client.pem" || ! -r "${cert_dir}/client-key.pem" ]]; then
+    generate-etcd-cert "${cert_dir}" "${master_ip}" "client" "client"
+  fi
+
+  generate-etcd-cert "${cert_dir}" "${master_ip}" "server" "server-${etcd_name}"
+  generate-etcd-cert "${cert_dir}" "${master_ip}" "peer" "peer-${etcd_name}"
 }
 
 # Run command over ssh
@@ -306,10 +378,10 @@ function kube-scp() {
 #   KUBE_USER
 #   KUBE_PASSWORD
 function get-password {
-  get-kubeconfig-basicauth
+  load-or-gen-kube-basicauth
   if [[ -z "${KUBE_USER}" || -z "${KUBE_PASSWORD}" ]]; then
     KUBE_USER=admin
     KUBE_PASSWORD=$(python -c 'import string,random; \
-      print "".join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(16))')
+      print("".join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(16)))')
   fi
 }

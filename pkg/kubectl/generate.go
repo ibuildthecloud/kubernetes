@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,8 +23,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/errors"
+	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 // GeneratorParam is a parameter for a generator
@@ -34,12 +35,20 @@ type GeneratorParam struct {
 	Required bool
 }
 
-// Generator is an interface for things that can generate API objects from input parameters.
+// Generator is an interface for things that can generate API objects from input
+// parameters. One example is the "expose" generator that is capable of exposing
+// new replication controllers and services, among other things.
 type Generator interface {
 	// Generate creates an API object given a set of parameters
 	Generate(params map[string]interface{}) (runtime.Object, error)
 	// ParamNames returns the list of parameters that this generator uses
 	ParamNames() []GeneratorParam
+}
+
+// StructuredGenerator is an interface for things that can generate API objects not using parameter injection
+type StructuredGenerator interface {
+	// StructuredGenerator creates an API object using pre-configured parameters
+	StructuredGenerate() (runtime.Object, error)
 }
 
 func IsZero(i interface{}) bool {
@@ -60,7 +69,59 @@ func ValidateParams(paramSpec []GeneratorParam, params map[string]interface{}) e
 			}
 		}
 	}
-	return errors.NewAggregate(allErrs)
+	return utilerrors.NewAggregate(allErrs)
+}
+
+// AnnotateFlags annotates all flags that are used by generators.
+func AnnotateFlags(cmd *cobra.Command, generators map[string]Generator) {
+	// Iterate over all generators and mark any flags used by them.
+	for name, generator := range generators {
+		generatorParams := map[string]struct{}{}
+		for _, param := range generator.ParamNames() {
+			generatorParams[param.Name] = struct{}{}
+		}
+
+		cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+			if _, found := generatorParams[flag.Name]; !found {
+				// This flag is not used by the current generator
+				// so skip it.
+				return
+			}
+			if flag.Annotations == nil {
+				flag.Annotations = map[string][]string{}
+			}
+			if annotations := flag.Annotations["generator"]; annotations == nil {
+				flag.Annotations["generator"] = []string{}
+			}
+			flag.Annotations["generator"] = append(flag.Annotations["generator"], name)
+		})
+	}
+}
+
+//  EnsureFlagsValid ensures that no invalid flags are being used against a generator.
+func EnsureFlagsValid(cmd *cobra.Command, generators map[string]Generator, generatorInUse string) error {
+	AnnotateFlags(cmd, generators)
+
+	allErrs := []error{}
+	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		// If the flag hasn't changed, don't validate it.
+		if !flag.Changed {
+			return
+		}
+		// Look into the flag annotations for the generators that can use it.
+		if annotations := flag.Annotations["generator"]; len(annotations) > 0 {
+			annotationMap := map[string]struct{}{}
+			for _, ann := range annotations {
+				annotationMap[ann] = struct{}{}
+			}
+			// If the current generator is not annotated, then this flag shouldn't
+			// be used with it.
+			if _, found := annotationMap[generatorInUse]; !found {
+				allErrs = append(allErrs, fmt.Errorf("cannot use --%s with --generator=%s", flag.Name, generatorInUse))
+			}
+		}
+	})
+	return utilerrors.NewAggregate(allErrs)
 }
 
 // MakeParams is a utility that creates generator parameters from a command line
@@ -73,6 +134,40 @@ func MakeParams(cmd *cobra.Command, params []GeneratorParam) map[string]interfac
 		}
 	}
 	return result
+}
+
+func MakeProtocols(protocols map[string]string) string {
+	out := []string{}
+	for key, value := range protocols {
+		out = append(out, fmt.Sprintf("%s/%s", key, value))
+	}
+	return strings.Join(out, ",")
+}
+
+func ParseProtocols(protocols interface{}) (map[string]string, error) {
+	protocolsString, isString := protocols.(string)
+	if !isString {
+		return nil, fmt.Errorf("expected string, found %v", protocols)
+	}
+	if len(protocolsString) == 0 {
+		return nil, fmt.Errorf("no protocols passed")
+	}
+	portProtocolMap := map[string]string{}
+	protocolsSlice := strings.Split(protocolsString, ",")
+	for ix := range protocolsSlice {
+		portProtocol := strings.Split(protocolsSlice[ix], "/")
+		if len(portProtocol) != 2 {
+			return nil, fmt.Errorf("unexpected port protocol mapping: %s", protocolsSlice[ix])
+		}
+		if len(portProtocol[0]) == 0 {
+			return nil, fmt.Errorf("unexpected empty port")
+		}
+		if len(portProtocol[1]) == 0 {
+			return nil, fmt.Errorf("unexpected empty protocol")
+		}
+		portProtocolMap[portProtocol[0]] = portProtocol[1]
+	}
+	return portProtocolMap, nil
 }
 
 func MakeLabels(labels map[string]string) string {
@@ -98,6 +193,9 @@ func ParseLabels(labelSpec interface{}) (map[string]string, error) {
 		labelSpec := strings.Split(labelSpecs[ix], "=")
 		if len(labelSpec) != 2 {
 			return nil, fmt.Errorf("unexpected label spec: %s", labelSpecs[ix])
+		}
+		if len(labelSpec[0]) == 0 {
+			return nil, fmt.Errorf("unexpected empty label key")
 		}
 		labels[labelSpec[0]] = labelSpec[1]
 	}

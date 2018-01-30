@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,19 +30,76 @@ if [ -f "${KUBE_ROOT}/cluster/env.sh" ]; then
     source "${KUBE_ROOT}/cluster/env.sh"
 fi
 
-source "${KUBE_ROOT}/cluster/kube-env.sh"
 source "${KUBE_ROOT}/cluster/kube-util.sh"
 
-echo "... Starting cluster using provider: $KUBERNETES_PROVIDER" >&2
+DEPRECATED_PROVIDERS=(
+  "centos"
+  "libvert-coreos"
+  "local"
+  "openstack-heat"
+  "photon-controller"
+  "vagrant"
+  "vsphere"
+  "windows"
+)
+
+for provider in "${DEPRECATED_PROVIDERS[@]}"; do
+  if [[ "${KUBERNETES_PROVIDER}" == "${provider}" ]]; then
+    cat <<EOF 1>&2
+
+!!! DEPRECATION NOTICE !!!
+
+The '${provider}' kube-up provider is deprecated and will be removed in a future
+release of kubernetes. Deprecated providers will be removed within 2 releases.
+
+See https://github.com/kubernetes/kubernetes/issues/49213 for more info.
+
+EOF
+    break
+  fi
+done
+
+if [ -z "${ZONE-}" ]; then
+  echo "... Starting cluster using provider: ${KUBERNETES_PROVIDER}" >&2
+else
+  echo "... Starting cluster in ${ZONE} using provider ${KUBERNETES_PROVIDER}" >&2
+fi
 
 echo "... calling verify-prereqs" >&2
 verify-prereqs
+echo "... calling verify-kube-binaries" >&2
+verify-kube-binaries
+
+if [[ "${KUBE_STAGE_IMAGES:-}" == "true" ]]; then
+  echo "... staging images" >&2
+  stage-images
+fi
 
 echo "... calling kube-up" >&2
 kube-up
 
 echo "... calling validate-cluster" >&2
-validate-cluster
+# Override errexit
+(validate-cluster) && validate_result="$?" || validate_result="$?"
+
+# We have two different failure modes from validate cluster:
+# - 1: fatal error - cluster won't be working correctly
+# - 2: weak error - something went wrong, but cluster probably will be working correctly
+# We just print an error message in case 2).
+if [[ "${validate_result}" == "1" ]]; then
+	exit 1
+elif [[ "${validate_result}" == "2" ]]; then
+	echo "...ignoring non-fatal errors in validate-cluster" >&2
+fi
+
+if [[ "${ENABLE_PROXY:-}" == "true" ]]; then
+  . /tmp/kube-proxy-env
+  echo ""
+  echo "*** Please run the following to add the kube-apiserver endpoint to your proxy white-list ***"
+  cat /tmp/kube-proxy-env
+  echo "***                                                                                      ***"
+  echo ""
+fi
 
 echo -e "Done, listing cluster services:\n" >&2
 "${KUBE_ROOT}/cluster/kubectl.sh" cluster-info

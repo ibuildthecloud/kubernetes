@@ -63,8 +63,9 @@ touch /var/log/etcd-events.log:
     - dir_mode: 755
     - context:
         suffix: ""
-        port: 4001
+        port: 2379
         server_port: 2380
+        cpulimit: '"200m"'
 
 /etc/kubernetes/manifests/etcd-events.manifest:
   file.managed:
@@ -79,3 +80,4 @@ touch /var/log/etcd-events.log:
         suffix: "-events"
         port: 4002
         server_port: 2381
+        cpulimit: '"100m"'

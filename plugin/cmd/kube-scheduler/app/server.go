@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,147 +19,165 @@ package app
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	goruntime "runtime"
 	"strconv"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	clientcmdapi "k8s.io/kubernetes/pkg/client/unversioned/clientcmd/api"
-	"k8s.io/kubernetes/pkg/healthz"
-	"k8s.io/kubernetes/pkg/master/ports"
-	"k8s.io/kubernetes/pkg/util"
-	"k8s.io/kubernetes/plugin/pkg/scheduler"
+	"k8s.io/apiserver/pkg/server/healthz"
+
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/pkg/util/configz"
+	"k8s.io/kubernetes/plugin/cmd/kube-scheduler/app/options"
 	_ "k8s.io/kubernetes/plugin/pkg/scheduler/algorithmprovider"
-	schedulerapi "k8s.io/kubernetes/plugin/pkg/scheduler/api"
-	latestschedulerapi "k8s.io/kubernetes/plugin/pkg/scheduler/api/latest"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/factory"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
-// SchedulerServer has all the context and params needed to run a Scheduler
-type SchedulerServer struct {
-	Port              int
-	Address           net.IP
-	AlgorithmProvider string
-	PolicyConfigFile  string
-	EnableProfiling   bool
-	Master            string
-	Kubeconfig        string
-	BindPodsQPS       float32
-	BindPodsBurst     int
-}
-
-// NewSchedulerServer creates a new SchedulerServer with default parameters
-func NewSchedulerServer() *SchedulerServer {
-	s := SchedulerServer{
-		Port:              ports.SchedulerPort,
-		Address:           net.ParseIP("127.0.0.1"),
-		AlgorithmProvider: factory.DefaultProvider,
+// NewSchedulerCommand creates a *cobra.Command object with default parameters
+func NewSchedulerCommand() *cobra.Command {
+	s := options.NewSchedulerServer()
+	s.AddFlags(pflag.CommandLine)
+	cmd := &cobra.Command{
+		Use: "kube-scheduler",
+		Long: `The Kubernetes scheduler is a policy-rich, topology-aware,
+workload-specific function that significantly impacts availability, performance,
+and capacity. The scheduler needs to take into account individual and collective
+resource requirements, quality of service requirements, hardware/software/policy
+constraints, affinity and anti-affinity specifications, data locality, inter-workload
+interference, deadlines, and so on. Workload-specific requirements will be exposed
+through the API as necessary.`,
+		Run: func(cmd *cobra.Command, args []string) {
+		},
 	}
-	return &s
-}
 
-// AddFlags adds flags for a specific SchedulerServer to the specified FlagSet
-func (s *SchedulerServer) AddFlags(fs *pflag.FlagSet) {
-	fs.IntVar(&s.Port, "port", s.Port, "The port that the scheduler's http service runs on")
-	fs.IPVar(&s.Address, "address", s.Address, "The IP address to serve on (set to 0.0.0.0 for all interfaces)")
-	fs.StringVar(&s.AlgorithmProvider, "algorithm-provider", s.AlgorithmProvider, "The scheduling algorithm provider to use, one of: "+factory.ListAlgorithmProviders())
-	fs.StringVar(&s.PolicyConfigFile, "policy-config-file", s.PolicyConfigFile, "File with scheduler policy configuration")
-	fs.BoolVar(&s.EnableProfiling, "profiling", true, "Enable profiling via web interface host:port/debug/pprof/")
-	fs.StringVar(&s.Master, "master", s.Master, "The address of the Kubernetes API server (overrides any value in kubeconfig)")
-	fs.StringVar(&s.Kubeconfig, "kubeconfig", s.Kubeconfig, "Path to kubeconfig file with authorization and master location information.")
-	fs.Float32Var(&s.BindPodsQPS, "bind-pods-qps", 15.0, "Number of bindings per second scheduler is allowed to continuously make")
-	fs.IntVar(&s.BindPodsBurst, "bind-pods-burst", 20, "Number of bindings per second scheduler is allowed to make during bursts")
+	return cmd
 }
 
 // Run runs the specified SchedulerServer.  This should never exit.
-func (s *SchedulerServer) Run(_ []string) error {
-	if s.Kubeconfig == "" && s.Master == "" {
-		glog.Warningf("Neither --kubeconfig nor --master was specified.  Using default API client.  This might not work.")
+func Run(s *options.SchedulerServer) error {
+	kubeClient, leaderElectionClient, err := createClients(s)
+	if err != nil {
+		return fmt.Errorf("unable to create kube client: %v", err)
 	}
 
-	// This creates a client, first loading any specified kubeconfig
-	// file, and then overriding the Master flag, if non-empty.
-	kubeconfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: s.Kubeconfig},
-		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{Server: s.Master}}).ClientConfig()
+	recorder := createRecorder(kubeClient, s)
+
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	// cache only non-terminal pods
+	podInformer := factory.NewPodInformer(kubeClient, 0)
+
+	sched, err := CreateScheduler(
+		s,
+		kubeClient,
+		informerFactory.Core().V1().Nodes(),
+		podInformer,
+		informerFactory.Core().V1().PersistentVolumes(),
+		informerFactory.Core().V1().PersistentVolumeClaims(),
+		informerFactory.Core().V1().ReplicationControllers(),
+		informerFactory.Extensions().V1beta1().ReplicaSets(),
+		informerFactory.Apps().V1beta1().StatefulSets(),
+		informerFactory.Core().V1().Services(),
+		recorder,
+	)
+	if err != nil {
+		return fmt.Errorf("error creating scheduler: %v", err)
+	}
+
+	if s.Port != -1 {
+		go startHTTP(s)
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go podInformer.Informer().Run(stop)
+	informerFactory.Start(stop)
+	// Waiting for all cache to sync before scheduling.
+	informerFactory.WaitForCacheSync(stop)
+	controller.WaitForCacheSync("scheduler", stop, podInformer.Informer().HasSynced)
+
+	run := func(stopCh <-chan struct{}) {
+		sched.Run()
+		<-stopCh
+	}
+
+	if !s.LeaderElection.LeaderElect {
+		run(stop)
+		return fmt.Errorf("finished without leader elect")
+	}
+
+	id, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("unable to get hostname: %v", err)
+	}
+
+	rl, err := resourcelock.New(s.LeaderElection.ResourceLock,
+		s.LockObjectNamespace,
+		s.LockObjectName,
+		leaderElectionClient.CoreV1(),
+		resourcelock.ResourceLockConfig{
+			Identity:      id,
+			EventRecorder: recorder,
+		})
+	if err != nil {
+		return fmt.Errorf("error creating lock: %v", err)
+	}
+
+	leaderElector, err := leaderelection.NewLeaderElector(
+		leaderelection.LeaderElectionConfig{
+			Lock:          rl,
+			LeaseDuration: s.LeaderElection.LeaseDuration.Duration,
+			RenewDeadline: s.LeaderElection.RenewDeadline.Duration,
+			RetryPeriod:   s.LeaderElection.RetryPeriod.Duration,
+			Callbacks: leaderelection.LeaderCallbacks{
+				OnStartedLeading: run,
+				OnStoppedLeading: func() {
+					utilruntime.HandleError(fmt.Errorf("lost master"))
+				},
+			},
+		})
 	if err != nil {
 		return err
 	}
-	kubeconfig.QPS = 20.0
-	kubeconfig.Burst = 30
 
-	kubeClient, err := client.New(kubeconfig)
-	if err != nil {
-		glog.Fatalf("Invalid API configuration: %v", err)
-	}
+	leaderElector.Run()
 
-	go func() {
-		mux := http.NewServeMux()
-		healthz.InstallHandler(mux)
-		if s.EnableProfiling {
-			mux.HandleFunc("/debug/pprof/", pprof.Index)
-			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		}
-		mux.Handle("/metrics", prometheus.Handler())
-
-		server := &http.Server{
-			Addr:    net.JoinHostPort(s.Address.String(), strconv.Itoa(s.Port)),
-			Handler: mux,
-		}
-		glog.Fatal(server.ListenAndServe())
-	}()
-
-	configFactory := factory.NewConfigFactory(kubeClient, util.NewTokenBucketRateLimiter(s.BindPodsQPS, s.BindPodsBurst))
-	config, err := s.createConfig(configFactory)
-	if err != nil {
-		glog.Fatalf("Failed to create scheduler configuration: %v", err)
-	}
-
-	eventBroadcaster := record.NewBroadcaster()
-	config.Recorder = eventBroadcaster.NewRecorder(api.EventSource{Component: "scheduler"})
-	eventBroadcaster.StartLogging(glog.Infof)
-	eventBroadcaster.StartRecordingToSink(kubeClient.Events(""))
-
-	sched := scheduler.New(config)
-	sched.Run()
-
-	select {}
+	return fmt.Errorf("lost lease")
 }
 
-func (s *SchedulerServer) createConfig(configFactory *factory.ConfigFactory) (*scheduler.Config, error) {
-	var policy schedulerapi.Policy
-	var configData []byte
-
-	if _, err := os.Stat(s.PolicyConfigFile); err == nil {
-		configData, err = ioutil.ReadFile(s.PolicyConfigFile)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to read policy config: %v", err)
+func startHTTP(s *options.SchedulerServer) {
+	mux := http.NewServeMux()
+	healthz.InstallHandler(mux)
+	if s.EnableProfiling {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		if s.EnableContentionProfiling {
+			goruntime.SetBlockProfileRate(1)
 		}
-		err = latestschedulerapi.Codec.DecodeInto(configData, &policy)
-		if err != nil {
-			return nil, fmt.Errorf("Invalid configuration: %v", err)
-		}
-
-		return configFactory.CreateFromConfig(policy)
 	}
-
-	// if the config file isn't provided, use the specified (or default) provider
-	// check of algorithm provider is registered and fail fast
-	_, err := factory.GetAlgorithmProvider(s.AlgorithmProvider)
-	if err != nil {
-		return nil, err
+	if c, err := configz.New("componentconfig"); err == nil {
+		c.Set(s.KubeSchedulerConfiguration)
+	} else {
+		glog.Errorf("unable to register configz: %s", err)
 	}
+	configz.InstallHandler(mux)
+	mux.Handle("/metrics", prometheus.Handler())
 
-	return configFactory.CreateFromProvider(s.AlgorithmProvider)
+	server := &http.Server{
+		Addr:    net.JoinHostPort(s.Address, strconv.Itoa(int(s.Port))),
+		Handler: mux,
+	}
+	glog.Fatal(server.ListenAndServe())
 }

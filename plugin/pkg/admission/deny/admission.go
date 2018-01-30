@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,12 @@ import (
 	"errors"
 	"io"
 
-	"k8s.io/kubernetes/pkg/admission"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/apiserver/pkg/admission"
 )
 
-func init() {
-	admission.RegisterPlugin("AlwaysDeny", func(client client.Interface, config io.Reader) (admission.Interface, error) {
+// Register registers a plugin
+func Register(plugins *admission.Plugins) {
+	plugins.Register("AlwaysDeny", func(config io.Reader) (admission.Interface, error) {
 		return NewAlwaysDeny(), nil
 	})
 }

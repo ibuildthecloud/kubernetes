@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,47 +17,21 @@ limitations under the License.
 package kubelet
 
 import (
-	"fmt"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
-	"k8s.io/kubernetes/pkg/runtime"
+	"github.com/stretchr/testify/assert"
+
+	"k8s.io/api/core/v1"
+	"k8s.io/client-go/tools/record"
+	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 )
 
-type fakeEvent struct {
-	object    runtime.Object
-	timestamp unversioned.Time
-	reason    string
-	message   string
-}
-
-type fakeRecorder struct {
-	events []fakeEvent
-}
-
-func (f fakeRecorder) Event(object runtime.Object, reason, message string) {
-	f.events = append(f.events, fakeEvent{object, unversioned.Now(), reason, message})
-}
-
-func (f fakeRecorder) Eventf(object runtime.Object, reason, messageFmt string, args ...interface{}) {
-	f.events = append(f.events, fakeEvent{object, unversioned.Now(), reason, fmt.Sprintf(messageFmt, args...)})
-}
-
-func (f fakeRecorder) PastEventf(object runtime.Object, timestamp unversioned.Time, reason, messageFmt string, args ...interface{}) {
-	f.events = append(f.events, fakeEvent{object, timestamp, reason, fmt.Sprintf(messageFmt, args...)})
-}
-
 func TestBasic(t *testing.T) {
-	fakeRecorder := fakeRecorder{}
-	mockCadvisor := &cadvisor.Fake{}
-	node := &api.ObjectReference{}
+	fakeRecorder := &record.FakeRecorder{}
+	mockCadvisor := &cadvisortest.Fake{}
+	node := &v1.ObjectReference{}
 	oomWatcher := NewOOMWatcher(mockCadvisor, fakeRecorder)
-	err := oomWatcher.Start(node)
-	if err != nil {
-		t.Errorf("Should not have failed: %v", err)
-	}
+	assert.NoError(t, oomWatcher.Start(node))
 
 	// TODO: Improve this test once cadvisor exports events.EventChannel as an interface
 	// and thereby allow using a mock version of cadvisor.

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestExtractFieldPathAsString(t *testing.T) {
@@ -40,8 +41,8 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		{
 			name:      "ok - namespace",
 			fieldPath: "metadata.namespace",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "object-namespace",
 				},
 			},
@@ -50,8 +51,8 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		{
 			name:      "ok - name",
 			fieldPath: "metadata.name",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Name: "object-name",
 				},
 			},
@@ -60,43 +61,43 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		{
 			name:      "ok - labels",
 			fieldPath: "metadata.labels",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"key": "value"},
 				},
 			},
-			expectedValue: "key=\"value\"\n",
+			expectedValue: "key=\"value\"",
 		},
 		{
 			name:      "ok - labels bslash n",
 			fieldPath: "metadata.labels",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"key": "value\n"},
 				},
 			},
-			expectedValue: "key=\"value\\n\"\n",
+			expectedValue: "key=\"value\\n\"",
 		},
 		{
 			name:      "ok - annotations",
 			fieldPath: "metadata.annotations",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{"builder": "john-doe"},
 				},
 			},
-			expectedValue: "builder=\"john-doe\"\n",
+			expectedValue: "builder=\"john-doe\"",
 		},
 
 		{
 			name:      "invalid expression",
 			fieldPath: "metadata.whoops",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "object-namespace",
 				},
 			},
-			expectedMessageFragment: "Unsupported fieldPath",
+			expectedMessageFragment: "unsupported fieldPath",
 		},
 	}
 
@@ -105,13 +106,13 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		if err != nil {
 			if tc.expectedMessageFragment != "" {
 				if !strings.Contains(err.Error(), tc.expectedMessageFragment) {
-					t.Errorf("%v: Unexpected error message: %q, expected to contain %q", tc.name, err, tc.expectedMessageFragment)
+					t.Errorf("%v: unexpected error message: %q, expected to contain %q", tc.name, err, tc.expectedMessageFragment)
 				}
 			} else {
 				t.Errorf("%v: unexpected error: %v", tc.name, err)
 			}
 		} else if e := tc.expectedValue; e != "" && e != actual {
-			t.Errorf("%v: Unexpected result; got %q, expected %q", tc.name, actual, e)
+			t.Errorf("%v: unexpected result; got %q, expected %q", tc.name, actual, e)
 		}
 	}
 }

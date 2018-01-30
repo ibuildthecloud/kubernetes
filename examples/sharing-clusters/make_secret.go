@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,9 +23,9 @@ import (
 	"io/ioutil"
 	"log"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/latest"
-	"k8s.io/kubernetes/pkg/runtime"
 )
 
 // TODO:
@@ -51,7 +51,7 @@ func main() {
 	}
 	cfg := read(*kubeconfig)
 	secret := &api.Secret{
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      *name,
 			Namespace: *ns,
 		},
@@ -59,5 +59,5 @@ func main() {
 			"config": cfg,
 		},
 	}
-	fmt.Printf(runtime.EncodeOrDie(latest.GroupOrDie("").Codec, secret))
+	fmt.Printf(runtime.EncodeOrDie(api.Codecs.LegacyCodec(api.Registry.EnabledVersions()...), secret))
 }

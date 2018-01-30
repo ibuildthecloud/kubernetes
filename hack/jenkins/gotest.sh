@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,8 +31,8 @@ export GOPATH=${HOME}/_gopath
 export PATH=${GOPATH}/bin:${HOME}/third_party/etcd:/usr/local/go/bin:$PATH
 
 # Install a few things needed by unit and /integration tests.
+command -v etcd &>/dev/null || ./hack/install-etcd.sh
 go get -u github.com/jstemmer/go-junit-report
-./hack/travis/install-etcd.sh
 
 # Enable the Go race detector.
 export KUBE_RACE=-race
@@ -41,5 +41,5 @@ export KUBE_JUNIT_REPORT_DIR=${WORKSPACE}/_artifacts
 # Save the verbose stdout as well.
 export KUBE_KEEP_VERBOSE_TEST_OUTPUT=y
 
-./hack/test-go.sh
-./hack/test-integration.sh
+make test
+make test-integration

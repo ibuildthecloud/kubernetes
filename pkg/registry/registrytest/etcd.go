@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,40 +20,39 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/coreos/go-etcd/etcd"
-
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/registry/rest/resttest"
+	etcdstorage "k8s.io/apiserver/pkg/storage/etcd"
+	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
+	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/rest/resttest"
 	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	etcdgeneric "k8s.io/kubernetes/pkg/registry/generic/etcd"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
-	etcdstorage "k8s.io/kubernetes/pkg/storage/etcd"
-	"k8s.io/kubernetes/pkg/tools"
-	"k8s.io/kubernetes/pkg/tools/etcdtest"
 )
 
-func NewEtcdStorage(t *testing.T, group string) (storage.Interface, *tools.FakeEtcdClient) {
-	fakeClient := tools.NewFakeEtcdClient(t)
-	fakeClient.TestIndex = true
-	etcdStorage := etcdstorage.NewEtcdStorage(fakeClient, testapi.Groups[group].Codec(), etcdtest.PathPrefix())
-	return etcdStorage, fakeClient
+func NewEtcdStorage(t *testing.T, group string) (*storagebackend.Config, *etcdtesting.EtcdTestServer) {
+	server, config := etcdtesting.NewUnsecuredEtcd3TestClientServer(t, api.Scheme)
+	config.Codec = testapi.Groups[group].StorageCodec()
+	return config, server
 }
 
 type Tester struct {
-	tester     *resttest.Tester
-	fakeClient *tools.FakeEtcdClient
-	storage    *etcdgeneric.Etcd
+	tester  *resttest.Tester
+	storage *genericregistry.Store
 }
 type UpdateFunc func(runtime.Object) runtime.Object
 
-func New(t *testing.T, fakeClient *tools.FakeEtcdClient, storage *etcdgeneric.Etcd) *Tester {
+func New(t *testing.T, storage *genericregistry.Store) *Tester {
 	return &Tester{
-		tester:     resttest.New(t, storage, fakeClient.SetError),
-		fakeClient: fakeClient,
-		storage:    storage,
+		tester:  resttest.New(t, storage, api.Scheme),
+		storage: storage,
 	}
 }
 
@@ -63,6 +62,11 @@ func (t *Tester) TestNamespace() string {
 
 func (t *Tester) ClusterScope() *Tester {
 	t.tester = t.tester.ClusterScope()
+	return t
+}
+
+func (t *Tester) Namer(namer func(int) string) *Tester {
+	t.tester = t.tester.Namer(namer)
 	return t
 }
 
@@ -84,7 +88,7 @@ func (t *Tester) ReturnDeletedObject() *Tester {
 func (t *Tester) TestCreate(valid runtime.Object, invalid ...runtime.Object) {
 	t.tester.TestCreate(
 		valid,
-		t.setObject,
+		t.createObject,
 		t.getObject,
 		invalid...,
 	)
@@ -97,8 +101,7 @@ func (t *Tester) TestUpdate(valid runtime.Object, validUpdateFunc UpdateFunc, in
 	}
 	t.tester.TestUpdate(
 		valid,
-		t.setObject,
-		t.setResourceVersion,
+		t.createObject,
 		t.getObject,
 		resttest.UpdateFunc(validUpdateFunc),
 		invalidFuncs...,
@@ -108,16 +111,16 @@ func (t *Tester) TestUpdate(valid runtime.Object, validUpdateFunc UpdateFunc, in
 func (t *Tester) TestDelete(valid runtime.Object) {
 	t.tester.TestDelete(
 		valid,
-		t.setObject,
+		t.createObject,
 		t.getObject,
-		isNotFoundEtcdError,
+		errors.IsNotFound,
 	)
 }
 
 func (t *Tester) TestDeleteGraceful(valid runtime.Object, expectedGrace int64) {
 	t.tester.TestDeleteGraceful(
 		valid,
-		t.setObject,
+		t.createObject,
 		t.getObject,
 		expectedGrace,
 	)
@@ -131,159 +134,102 @@ func (t *Tester) TestList(valid runtime.Object) {
 	t.tester.TestList(
 		valid,
 		t.setObjectsForList,
-		t.setResourceVersion,
 	)
 }
 
 func (t *Tester) TestWatch(valid runtime.Object, labelsPass, labelsFail []labels.Set, fieldsPass, fieldsFail []fields.Set) {
 	t.tester.TestWatch(
 		valid,
-		t.fakeClient.WaitForWatchCompletion,
-		t.injectWatchError,
 		t.emitObject,
 		labelsPass,
 		labelsFail,
 		fieldsPass,
 		fieldsFail,
-		[]string{etcdstorage.EtcdCreate, etcdstorage.EtcdSet, etcdstorage.EtcdCAS, etcdstorage.EtcdDelete},
+		// TODO: This should be filtered, the registry should not be aware of this level of detail
+		[]string{etcdstorage.EtcdCreate, etcdstorage.EtcdDelete},
 	)
 }
 
 // =============================================================================
 // get codec based on runtime.Object
 func getCodec(obj runtime.Object) (runtime.Codec, error) {
-	_, kind, err := api.Scheme.ObjectVersionAndKind(obj)
+	fqKinds, _, err := api.Scheme.ObjectKinds(obj)
 	if err != nil {
 		return nil, fmt.Errorf("unexpected encoding error: %v", err)
 	}
+	fqKind := fqKinds[0]
 	// TODO: caesarxuchao: we should detect which group an object belongs to
 	// by using the version returned by Schem.ObjectVersionAndKind() once we
 	// split the schemes for internal objects.
 	// TODO: caesarxuchao: we should add a map from kind to group in Scheme.
 	var codec runtime.Codec
-	if api.Scheme.Recognizes(testapi.Default.GroupAndVersion(), kind) {
+	if api.Scheme.Recognizes(api.Registry.GroupOrDie(api.GroupName).GroupVersion.WithKind(fqKind.Kind)) {
 		codec = testapi.Default.Codec()
-	} else if api.Scheme.Recognizes(testapi.Experimental.GroupAndVersion(), kind) {
-		codec = testapi.Experimental.Codec()
+	} else if api.Scheme.Recognizes(testapi.Extensions.GroupVersion().WithKind(fqKind.Kind)) {
+		codec = testapi.Extensions.Codec()
 	} else {
-		return nil, fmt.Errorf("unexpected kind: %v", kind)
+		return nil, fmt.Errorf("unexpected kind: %v", fqKind)
 	}
 	return codec, nil
 }
 
 // Helper functions
 
-func (t *Tester) getObject(ctx api.Context, obj runtime.Object) (runtime.Object, error) {
-	meta, err := api.ObjectMetaFor(obj)
+func (t *Tester) getObject(ctx genericapirequest.Context, obj runtime.Object) (runtime.Object, error) {
+	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return nil, err
 	}
-	key, err := t.storage.KeyFunc(ctx, meta.Name)
-	if err != nil {
-		return nil, err
-	}
-	key = etcdtest.AddPrefix(key)
-	resp, err := t.fakeClient.Get(key, false, false)
-	if err != nil {
-		return nil, err
-	}
-	result := t.storage.NewFunc()
 
-	codec, err := getCodec(obj)
+	result, err := t.storage.Get(ctx, accessor.GetName(), &metav1.GetOptions{})
 	if err != nil {
-		return nil, err
-	}
-	if err := codec.DecodeInto([]byte(resp.Node.Value), result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-func (t *Tester) setObject(ctx api.Context, obj runtime.Object) error {
-	meta, err := api.ObjectMetaFor(obj)
+func (t *Tester) createObject(ctx genericapirequest.Context, obj runtime.Object) error {
+	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return err
 	}
-	key, err := t.storage.KeyFunc(ctx, meta.Name)
+	key, err := t.storage.KeyFunc(ctx, accessor.GetName())
 	if err != nil {
 		return err
 	}
-	key = etcdtest.AddPrefix(key)
-
-	codec, err := getCodec(obj)
-	if err != nil {
-		return err
-	}
-	_, err = t.fakeClient.Set(key, runtime.EncodeOrDie(codec, obj), 0)
-	return err
+	return t.storage.Storage.Create(ctx, key, obj, nil, 0)
 }
 
 func (t *Tester) setObjectsForList(objects []runtime.Object) []runtime.Object {
-	result := make([]runtime.Object, len(objects))
-	key := etcdtest.AddPrefix(t.storage.KeyRootFunc(t.tester.TestContext()))
-
-	if len(objects) > 0 {
-		nodes := make([]*etcd.Node, len(objects))
-		for i, obj := range objects {
-			codec, _ := getCodec(obj)
-			encoded := runtime.EncodeOrDie(codec, obj)
-			decoded, _ := codec.Decode([]byte(encoded))
-			nodes[i] = &etcd.Node{Value: encoded}
-			result[i] = decoded
-		}
-		t.fakeClient.Data[key] = tools.EtcdResponseWithError{
-			R: &etcd.Response{
-				Node: &etcd.Node{
-					Nodes: nodes,
-				},
-			},
-			E: nil,
-		}
-	} else {
-		t.fakeClient.Data[key] = tools.EtcdResponseWithError{
-			R: &etcd.Response{},
-			E: t.fakeClient.NewError(tools.EtcdErrorCodeNotFound),
-		}
+	key := t.storage.KeyRootFunc(t.tester.TestContext())
+	if _, err := t.storage.DeleteCollection(t.tester.TestContext(), nil, nil); err != nil {
+		t.tester.Errorf("unable to clear collection: %v", err)
+		return nil
 	}
-	return result
-}
-
-func (t *Tester) setResourceVersion(resourceVersion uint64) {
-	t.fakeClient.ChangeIndex = resourceVersion
-}
-
-func (t *Tester) injectWatchError(err error) {
-	t.fakeClient.WatchInjectError <- err
+	if err := storagetesting.CreateObjList(key, t.storage.Storage, objects); err != nil {
+		t.tester.Errorf("unexpected error: %v", err)
+		return nil
+	}
+	return objects
 }
 
 func (t *Tester) emitObject(obj runtime.Object, action string) error {
-	codec, err := getCodec(obj)
-	if err != nil {
-		return err
-	}
-	encoded, err := codec.Encode(obj)
-	if err != nil {
-		return err
-	}
-	node := &etcd.Node{
-		Value: string(encoded),
-	}
-	var prevNode *etcd.Node = nil
-	if action == etcdstorage.EtcdDelete {
-		prevNode = node
-	}
-	t.fakeClient.WatchResponse <- &etcd.Response{
-		Action:   action,
-		Node:     node,
-		PrevNode: prevNode,
-	}
-	return nil
-}
+	ctx := t.tester.TestContext()
+	var err error
 
-func isNotFoundEtcdError(err error) bool {
-	etcdError, ok := err.(*etcd.EtcdError)
-	if !ok {
-		return false
+	switch action {
+	case etcdstorage.EtcdCreate:
+		err = t.createObject(ctx, obj)
+	case etcdstorage.EtcdDelete:
+		var accessor metav1.Object
+		accessor, err = meta.Accessor(obj)
+		if err != nil {
+			return err
+		}
+		_, _, err = t.storage.Delete(ctx, accessor.GetName(), nil)
+	default:
+		err = fmt.Errorf("unexpected action: %v", action)
 	}
-	return etcdError.ErrorCode == tools.EtcdErrorCodeNotFound
+
+	return err
 }

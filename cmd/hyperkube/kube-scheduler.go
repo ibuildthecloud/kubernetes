@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,24 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/cmd/km/k8sm-scheduler.go
 package main
 
 import (
-	scheduler "k8s.io/kubernetes/plugin/cmd/kube-scheduler/app"
+	"k8s.io/kubernetes/plugin/cmd/kube-scheduler/app"
+	"k8s.io/kubernetes/plugin/cmd/kube-scheduler/app/options"
 )
 
 // NewScheduler creates a new hyperkube Server object that includes the
 // description and flags.
 func NewScheduler() *Server {
-	s := scheduler.NewSchedulerServer()
+	s := options.NewSchedulerServer()
 
 	hks := Server{
-		SimpleUsage: "scheduler",
-		Long:        "Implements a Kubernetes scheduler.  This will assign pods to kubelets based on capacity and constraints.",
-		Run: func(_ *Server, args []string) error {
-			return s.Run(args)
+		name:            "scheduler",
+		AlternativeName: "kube-scheduler",
+		SimpleUsage:     "scheduler",
+		Long:            "Implements a Kubernetes scheduler.  This will assign pods to kubelets based on capacity and constraints.",
+		Run: func(_ *Server, _ []string, stopCh <-chan struct{}) error {
+			return app.Run(s)
 		},
 	}
 	s.AddFlags(hks.Flags())

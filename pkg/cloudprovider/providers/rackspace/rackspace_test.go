@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -107,6 +107,27 @@ func configFromEnv() (cfg Config, ok bool) {
 	return
 }
 
+func TestParseMetaData(t *testing.T) {
+	_, err := parseMetaData(strings.NewReader(""))
+	if err == nil {
+		t.Errorf("Should fail when invalid meta data is provided: %s", err)
+	}
+
+	id, err := parseMetaData(strings.NewReader(`
+	{
+		"UUID":"someuuid",
+		"name":"somename",
+		"project_id":"someprojectid"
+	}
+	`))
+	if err != nil {
+		t.Fatalf("Should succeed when valid meta data is provided: %s", err)
+	}
+	if id != "someuuid" {
+		t.Errorf("incorrect uuid: %s", id)
+	}
+}
+
 func TestNewRackspace(t *testing.T) {
 	cfg, ok := configFromEnv()
 	if !ok {
@@ -117,38 +138,6 @@ func TestNewRackspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to construct/authenticate Rackspace: %s", err)
 	}
-}
-
-func TestInstances(t *testing.T) {
-	cfg, ok := configFromEnv()
-	if !ok {
-		t.Skipf("No config found in environment")
-	}
-
-	os, err := newRackspace(cfg)
-	if err != nil {
-		t.Fatalf("Failed to construct/authenticate Rackspace: %s", err)
-	}
-
-	i, ok := os.Instances()
-	if !ok {
-		t.Fatalf("Instances() returned false")
-	}
-
-	srvs, err := i.List(".")
-	if err != nil {
-		t.Fatalf("Instances.List() failed: %s", err)
-	}
-	if len(srvs) == 0 {
-		t.Fatalf("Instances.List() returned zero servers")
-	}
-	t.Logf("Found servers (%d): %s\n", len(srvs), srvs)
-
-	addrs, err := i.NodeAddresses(srvs[0])
-	if err != nil {
-		t.Fatalf("Instances.NodeAddresses(%s) failed: %s", srvs[0], err)
-	}
-	t.Logf("Found NodeAddresses(%s) = %s\n", srvs[0], addrs)
 }
 
 func TestZones(t *testing.T) {
@@ -171,5 +160,48 @@ func TestZones(t *testing.T) {
 
 	if zone.Region != "myRegion" {
 		t.Fatalf("GetZone() returned wrong region (%s)", zone.Region)
+	}
+}
+
+func TestInstanceIDFromProviderID(t *testing.T) {
+	testCases := []struct {
+		providerID string
+		instanceID string
+		fail       bool
+	}{
+		{
+			providerID: ProviderName + "://7b9cf879-7146-417c-abfd-cb4272f0c935",
+			instanceID: "7b9cf879-7146-417c-abfd-cb4272f0c935",
+			fail:       false,
+		},
+		{
+			providerID: "7b9cf879-7146-417c-abfd-cb4272f0c935",
+			instanceID: "",
+			fail:       true,
+		},
+		{
+			providerID: "other-provider://7b9cf879-7146-417c-abfd-cb4272f0c935",
+			instanceID: "",
+			fail:       true,
+		},
+		{
+			providerID: "",
+			instanceID: "",
+			fail:       true,
+		},
+	}
+
+	for _, test := range testCases {
+		instanceID, err := instanceIDFromProviderID(test.providerID)
+		if (err != nil) != test.fail {
+			t.Errorf("%s yielded `err != nil` as %t. expected %t", test.providerID, (err != nil), test.fail)
+		}
+
+		if test.fail {
+			continue
+		}
+		if instanceID != test.instanceID {
+			t.Errorf("%s yielded %s. expected %s", test.providerID, instanceID, test.instanceID)
+		}
 	}
 }

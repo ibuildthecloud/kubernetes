@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,271 +18,358 @@ package util
 
 import (
 	"bytes"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/user"
 	"path"
+	"sort"
 	"strconv"
+	"strings"
+	"time"
 
+	swagger "github.com/emicklei/go-restful-swagger12"
+	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	fedclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_clientset"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/meta"
-	"k8s.io/kubernetes/pkg/api/registered"
-	"k8s.io/kubernetes/pkg/api/validation"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	apiv1 "k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	coreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 	"k8s.io/kubernetes/pkg/kubectl"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/util/openapi"
+	"k8s.io/kubernetes/pkg/kubectl/plugins"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/kubectl/validation"
+	"k8s.io/kubernetes/pkg/printers"
 )
 
 const (
 	FlagMatchBinaryVersion = "match-server-version"
 )
 
+var (
+	FlagHTTPCacheDir = "cache-dir"
+)
+
 // Factory provides abstractions that allow the Kubectl command to be extended across multiple types
 // of resources and different API sets.
+// The rings are here for a reason.  In order for composers to be able to provide alternative factory implementations
+// they need to provide low level pieces of *certain* functions so that when the factory calls back into itself
+// it uses the custom version of the function.  Rather than try to enumerate everything that someone would want to override
+// we split the factory into rings, where each ring can depend on methods  an earlier ring, but cannot depend
+// upon peer methods in its own ring.
 // TODO: make the functions interfaces
 // TODO: pass the various interfaces on the factory directly into the command constructors (so the
 // commands are decoupled from the factory).
-type Factory struct {
-	clients    *ClientCache
-	flags      *pflag.FlagSet
-	generators map[string]kubectl.Generator
+type Factory interface {
+	ClientAccessFactory
+	ObjectMappingFactory
+	BuilderFactory
+}
 
-	// Returns interfaces for dealing with arbitrary runtime.Objects.
-	Object func() (meta.RESTMapper, runtime.ObjectTyper)
-	// Returns a client for accessing Kubernetes resources or an error.
-	Client func() (*client.Client, error)
+type DiscoveryClientFactory interface {
+	// Returns a discovery client
+	DiscoveryClient() (discovery.CachedDiscoveryInterface, error)
+
+	// BindFlags adds any discovery flags that are common to all kubectl sub commands.
+	BindFlags(flags *pflag.FlagSet)
+}
+
+// ClientAccessFactory holds the first level of factory methods.
+// Generally provides discovery, negotiation, and no-dep calls.
+// TODO The polymorphic calls probably deserve their own interface.
+type ClientAccessFactory interface {
+	// Returns a discovery client
+	DiscoveryClient() (discovery.CachedDiscoveryInterface, error)
+
+	// ClientSet gives you back an internal, generated clientset
+	ClientSet() (internalclientset.Interface, error)
+
+	// KubernetesClientSet gives you back an external clientset
+	KubernetesClientSet() (*kubernetes.Clientset, error)
+
+	// Returns a RESTClient for accessing Kubernetes resources or an error.
+	RESTClient() (*restclient.RESTClient, error)
 	// Returns a client.Config for accessing the Kubernetes server.
-	ClientConfig func() (*client.Config, error)
-	// Returns a RESTClient for working with the specified RESTMapping or an error. This is intended
-	// for working with arbitrary resources and is not guaranteed to point to a Kubernetes APIServer.
-	RESTClient func(mapping *meta.RESTMapping) (resource.RESTClient, error)
-	// Returns a Describer for displaying the specified RESTMapping type or an error.
-	Describer func(mapping *meta.RESTMapping) (kubectl.Describer, error)
-	// Returns a Printer for formatting objects of the given type or an error.
-	Printer func(mapping *meta.RESTMapping, noHeaders, withNamespace bool, wide bool, showAll bool, columnLabels []string) (kubectl.ResourcePrinter, error)
-	// Returns a Scaler for changing the size of the specified RESTMapping type or an error
-	Scaler func(mapping *meta.RESTMapping) (kubectl.Scaler, error)
-	// Returns a Reaper for gracefully shutting down resources.
-	Reaper func(mapping *meta.RESTMapping) (kubectl.Reaper, error)
-	// PodSelectorForObject returns the pod selector associated with the provided object
-	PodSelectorForObject func(object runtime.Object) (string, error)
+	ClientConfig() (*restclient.Config, error)
+	// BareClientConfig returns a client.Config that has NOT been negotiated. It's
+	// just directions to the server. People use this to build RESTMappers on top of
+	BareClientConfig() (*restclient.Config, error)
+
+	// TODO this should probably be removed and collapsed into whatever we want to use long term
+	// probably returning a restclient for a version and leaving contruction up to someone else
+	FederationClientSetForVersion(version *schema.GroupVersion) (fedclientset.Interface, error)
+	// TODO remove this should be rolled into restclient with the right version
+	FederationClientForVersion(version *schema.GroupVersion) (*restclient.RESTClient, error)
+	// TODO remove.  This should be rolled into `ClientSet`
+	ClientSetForVersion(requiredVersion *schema.GroupVersion) (internalclientset.Interface, error)
+	// TODO remove.  This should be rolled into `ClientConfig`
+	ClientConfigForVersion(requiredVersion *schema.GroupVersion) (*restclient.Config, error)
+
+	// Returns interfaces for decoding objects - if toInternal is set, decoded objects will be converted
+	// into their internal form (if possible). Eventually the internal form will be removed as an option,
+	// and only versioned objects will be returned.
+	Decoder(toInternal bool) runtime.Decoder
+	// Returns an encoder capable of encoding a provided object into JSON in the default desired version.
+	JSONEncoder() runtime.Encoder
+
+	// UpdatePodSpecForObject will call the provided function on the pod spec this object supports,
+	// return false if no pod spec is supported, or return an error.
+	UpdatePodSpecForObject(obj runtime.Object, fn func(*api.PodSpec) error) (bool, error)
+
+	// MapBasedSelectorForObject returns the map-based selector associated with the provided object. If a
+	// new set-based selector is provided, an error is returned if the selector cannot be converted to a
+	// map-based selector
+	MapBasedSelectorForObject(object runtime.Object) (string, error)
 	// PortsForObject returns the ports associated with the provided object
-	PortsForObject func(object runtime.Object) ([]string, error)
+	PortsForObject(object runtime.Object) ([]string, error)
+	// ProtocolsForObject returns the <port, protocol> mapping associated with the provided object
+	ProtocolsForObject(object runtime.Object) (map[string]string, error)
 	// LabelsForObject returns the labels associated with the provided object
-	LabelsForObject func(object runtime.Object) (map[string]string, error)
-	// Returns a schema that can validate objects stored on disk.
-	Validator func(validate bool, cacheDir string) (validation.Schema, error)
+	LabelsForObject(object runtime.Object) (map[string]string, error)
+
+	// Returns internal flagset
+	FlagSet() *pflag.FlagSet
+	// Command will stringify and return all environment arguments ie. a command run by a client
+	// using the factory.
+	Command(cmd *cobra.Command, showSecrets bool) string
+	// BindFlags adds any flags that are common to all kubectl sub commands.
+	BindFlags(flags *pflag.FlagSet)
+	// BindExternalFlags adds any flags defined by external projects (not part of pflags)
+	BindExternalFlags(flags *pflag.FlagSet)
+
+	// TODO: Break the dependency on cmd here.
+	DefaultResourceFilterOptions(cmd *cobra.Command, withNamespace bool) *printers.PrintOptions
+	// DefaultResourceFilterFunc returns a collection of FilterFuncs suitable for filtering specific resource types.
+	DefaultResourceFilterFunc() kubectl.Filters
+
+	// SuggestedPodTemplateResources returns a list of resource types that declare a pod template
+	SuggestedPodTemplateResources() []schema.GroupResource
+
+	// Returns a Printer for formatting objects of the given type or an error.
+	Printer(mapping *meta.RESTMapping, options printers.PrintOptions) (printers.ResourcePrinter, error)
+	// Pauser marks the object in the info as paused. Currently supported only for Deployments.
+	// Returns the patched object in bytes and any error that occured during the encoding or
+	// in case the object is already paused.
+	Pauser(info *resource.Info) ([]byte, error)
+	// Resumer resumes a paused object inside the info. Currently supported only for Deployments.
+	// Returns the patched object in bytes and any error that occured during the encoding or
+	// in case the object is already resumed.
+	Resumer(info *resource.Info) ([]byte, error)
+
+	// ResolveImage resolves the image names. For kubernetes this function is just
+	// passthrough but it allows to perform more sophisticated image name resolving for
+	// third-party vendors.
+	ResolveImage(imageName string) (string, error)
+
 	// Returns the default namespace to use in cases where no
 	// other namespace is specified and whether the namespace was
-	// overriden.
-	DefaultNamespace func() (string, bool, error)
-	// Returns the generator for the provided generator name
-	Generator func(name string) (kubectl.Generator, bool)
+	// overridden.
+	DefaultNamespace() (string, bool, error)
+	// Generators returns the generators for the provided command
+	Generators(cmdName string) map[string]kubectl.Generator
 	// Check whether the kind of resources could be exposed
-	CanBeExposed func(kind string) error
+	CanBeExposed(kind schema.GroupKind) error
+	// Check whether the kind of resources could be autoscaled
+	CanBeAutoscaled(kind schema.GroupKind) error
+
+	// EditorEnvs returns a group of environment variables that the edit command
+	// can range over in order to determine if the user has specified an editor
+	// of their choice.
+	EditorEnvs() []string
+
+	// PrintObjectSpecificMessage prints object-specific messages on the provided writer
+	PrintObjectSpecificMessage(obj runtime.Object, out io.Writer)
+}
+
+// ObjectMappingFactory holds the second level of factory methods.  These functions depend upon ClientAccessFactory methods.
+// Generally they provide object typing and functions that build requests based on the negotiated clients.
+type ObjectMappingFactory interface {
+	// Returns interfaces for dealing with arbitrary runtime.Objects.
+	Object() (meta.RESTMapper, runtime.ObjectTyper)
+	// Returns interfaces for dealing with arbitrary
+	// runtime.Unstructured. This performs API calls to discover types.
+	UnstructuredObject() (meta.RESTMapper, runtime.ObjectTyper, error)
+	// Returns interface for expanding categories like `all`.
+	CategoryExpander() resource.CategoryExpander
+	// Returns a RESTClient for working with the specified RESTMapping or an error. This is intended
+	// for working with arbitrary resources and is not guaranteed to point to a Kubernetes APIServer.
+	ClientForMapping(mapping *meta.RESTMapping) (resource.RESTClient, error)
+	// Returns a RESTClient for working with Unstructured objects.
+	UnstructuredClientForMapping(mapping *meta.RESTMapping) (resource.RESTClient, error)
+	// Returns a Describer for displaying the specified RESTMapping type or an error.
+	Describer(mapping *meta.RESTMapping) (printers.Describer, error)
+
+	// LogsForObject returns a request for the logs associated with the provided object
+	LogsForObject(object, options runtime.Object, timeout time.Duration) (*restclient.Request, error)
+	// Returns a Scaler for changing the size of the specified RESTMapping type or an error
+	Scaler(mapping *meta.RESTMapping) (kubectl.Scaler, error)
+	// Returns a Reaper for gracefully shutting down resources.
+	Reaper(mapping *meta.RESTMapping) (kubectl.Reaper, error)
+	// Returns a HistoryViewer for viewing change history
+	HistoryViewer(mapping *meta.RESTMapping) (kubectl.HistoryViewer, error)
+	// Returns a Rollbacker for changing the rollback version of the specified RESTMapping type or an error
+	Rollbacker(mapping *meta.RESTMapping) (kubectl.Rollbacker, error)
+	// Returns a StatusViewer for printing rollout status.
+	StatusViewer(mapping *meta.RESTMapping) (kubectl.StatusViewer, error)
+
+	// AttachablePodForObject returns the pod to which to attach given an object.
+	AttachablePodForObject(object runtime.Object, timeout time.Duration) (*api.Pod, error)
+
+	// Returns a schema that can validate objects stored on disk.
+	Validator(validate bool, openapi bool, cacheDir string) (validation.Schema, error)
+	// SwaggerSchema returns the schema declaration for the provided group version kind.
+	SwaggerSchema(schema.GroupVersionKind) (*swagger.ApiDeclaration, error)
+	// OpenAPISchema returns the schema openapi schema definiton
+	OpenAPISchema() (openapi.Resources, error)
+}
+
+// BuilderFactory holds the second level of factory methods.  These functions depend upon ObjectMappingFactory and ClientAccessFactory methods.
+// Generally they depend upon client mapper functions
+type BuilderFactory interface {
+	// PrinterForCommand returns the default printer for the command. It requires that certain options
+	// are declared on the command (see AddPrinterFlags). Returns a printer, or an error if a printer
+	// could not be found.
+	// TODO: Break the dependency on cmd here.
+	PrinterForCommand(cmd *cobra.Command, isLocal bool, outputOpts *printers.OutputOptions, options printers.PrintOptions) (printers.ResourcePrinter, error)
+	// PrinterForMapping returns a printer suitable for displaying the provided resource type.
+	// Requires that printer flags have been added to cmd (see AddPrinterFlags).
+	// Returns a printer, true if the printer is generic (is not internal), or
+	// an error if a printer could not be found.
+	PrinterForMapping(cmd *cobra.Command, isLocal bool, outputOpts *printers.OutputOptions, mapping *meta.RESTMapping, withNamespace bool) (printers.ResourcePrinter, error)
+	// PrintObject prints an api object given command line flags to modify the output format
+	PrintObject(cmd *cobra.Command, isLocal bool, mapper meta.RESTMapper, obj runtime.Object, out io.Writer) error
+	// One stop shopping for a Builder
+	NewBuilder(allowRemoteCalls bool) *resource.Builder
+	// Resource builder for working with unstructured objects
+	NewUnstructuredBuilder(allowRemoteCalls bool) (*resource.Builder, error)
+	// PluginLoader provides the implementation to be used to load cli plugins.
+	PluginLoader() plugins.PluginLoader
+	// PluginRunner provides the implementation to be used to run cli plugins.
+	PluginRunner() plugins.PluginRunner
+}
+
+func getGroupVersionKinds(gvks []schema.GroupVersionKind, group string) []schema.GroupVersionKind {
+	result := []schema.GroupVersionKind{}
+	for ix := range gvks {
+		if gvks[ix].Group == group {
+			result = append(result, gvks[ix])
+		}
+	}
+	return result
+}
+
+type factory struct {
+	ClientAccessFactory
+	ObjectMappingFactory
+	BuilderFactory
 }
 
 // NewFactory creates a factory with the default Kubernetes resources defined
 // if optionalClientConfig is nil, then flags will be bound to a new clientcmd.ClientConfig.
 // if optionalClientConfig is not nil, then this factory will make use of it.
-func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
-	mapper := kubectl.ShortcutExpander{RESTMapper: api.RESTMapper}
+func NewFactory(optionalClientConfig clientcmd.ClientConfig) Factory {
+	clientAccessFactory := NewClientAccessFactory(optionalClientConfig)
+	objectMappingFactory := NewObjectMappingFactory(clientAccessFactory)
+	builderFactory := NewBuilderFactory(clientAccessFactory, objectMappingFactory)
 
-	flags := pflag.NewFlagSet("", pflag.ContinueOnError)
-	flags.SetNormalizeFunc(util.WarnWordSepNormalizeFunc) // Warn for "_" flags
-
-	generators := map[string]kubectl.Generator{
-		"run/v1":     kubectl.BasicReplicationController{},
-		"run-pod/v1": kubectl.BasicPod{},
-		"service/v1": kubectl.ServiceGeneratorV1{},
-		"service/v2": kubectl.ServiceGeneratorV2{},
-	}
-
-	clientConfig := optionalClientConfig
-	if optionalClientConfig == nil {
-		clientConfig = DefaultClientConfig(flags)
-	}
-
-	clients := NewClientCache(clientConfig)
-
-	return &Factory{
-		clients:    clients,
-		flags:      flags,
-		generators: generators,
-
-		Object: func() (meta.RESTMapper, runtime.ObjectTyper) {
-			cfg, err := clientConfig.ClientConfig()
-			CheckErr(err)
-			cmdApiVersion := cfg.Version
-
-			return kubectl.OutputVersionMapper{RESTMapper: mapper, OutputVersion: cmdApiVersion}, api.Scheme
-		},
-		Client: func() (*client.Client, error) {
-			return clients.ClientForVersion("")
-		},
-		ClientConfig: func() (*client.Config, error) {
-			return clients.ClientConfigForVersion("")
-		},
-		RESTClient: func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
-			group, err := api.RESTMapper.GroupForResource(mapping.Resource)
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			switch group {
-			case "":
-				return client.RESTClient, nil
-			case "experimental":
-				return client.ExperimentalClient.RESTClient, nil
-			}
-			return nil, fmt.Errorf("unable to get RESTClient for resource '%s'", mapping.Resource)
-		},
-		Describer: func(mapping *meta.RESTMapping) (kubectl.Describer, error) {
-			group, err := api.RESTMapper.GroupForResource(mapping.Resource)
-			if err != nil {
-				return nil, err
-			}
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			if describer, ok := kubectl.DescriberFor(group, mapping.Kind, client); ok {
-				return describer, nil
-			}
-			return nil, fmt.Errorf("no description has been implemented for %q", mapping.Kind)
-		},
-		Printer: func(mapping *meta.RESTMapping, noHeaders, withNamespace bool, wide bool, showAll bool, columnLabels []string) (kubectl.ResourcePrinter, error) {
-			return kubectl.NewHumanReadablePrinter(noHeaders, withNamespace, wide, showAll, columnLabels), nil
-		},
-		PodSelectorForObject: func(object runtime.Object) (string, error) {
-			// TODO: replace with a swagger schema based approach (identify pod selector via schema introspection)
-			switch t := object.(type) {
-			case *api.ReplicationController:
-				return kubectl.MakeLabels(t.Spec.Selector), nil
-			case *api.Pod:
-				if len(t.Labels) == 0 {
-					return "", fmt.Errorf("the pod has no labels and cannot be exposed")
-				}
-				return kubectl.MakeLabels(t.Labels), nil
-			case *api.Service:
-				if t.Spec.Selector == nil {
-					return "", fmt.Errorf("the service has no pod selector set")
-				}
-				return kubectl.MakeLabels(t.Spec.Selector), nil
-			default:
-				_, kind, err := api.Scheme.ObjectVersionAndKind(object)
-				if err != nil {
-					return "", err
-				}
-				return "", fmt.Errorf("cannot extract pod selector from %s", kind)
-			}
-		},
-		PortsForObject: func(object runtime.Object) ([]string, error) {
-			// TODO: replace with a swagger schema based approach (identify pod selector via schema introspection)
-			switch t := object.(type) {
-			case *api.ReplicationController:
-				return getPorts(t.Spec.Template.Spec), nil
-			case *api.Pod:
-				return getPorts(t.Spec), nil
-			case *api.Service:
-				return getServicePorts(t.Spec), nil
-			default:
-				_, kind, err := api.Scheme.ObjectVersionAndKind(object)
-				if err != nil {
-					return nil, err
-				}
-				return nil, fmt.Errorf("cannot extract ports from %s", kind)
-			}
-		},
-		LabelsForObject: func(object runtime.Object) (map[string]string, error) {
-			return meta.NewAccessor().Labels(object)
-		},
-		Scaler: func(mapping *meta.RESTMapping) (kubectl.Scaler, error) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return kubectl.ScalerFor(mapping.Kind, client)
-		},
-		Reaper: func(mapping *meta.RESTMapping) (kubectl.Reaper, error) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return kubectl.ReaperFor(mapping.Kind, client)
-		},
-		Validator: func(validate bool, cacheDir string) (validation.Schema, error) {
-			if validate {
-				client, err := clients.ClientForVersion("")
-				if err != nil {
-					return nil, err
-				}
-				dir := cacheDir
-				if len(dir) > 0 {
-					version, err := client.ServerVersion()
-					if err != nil {
-						return nil, err
-					}
-					dir = path.Join(cacheDir, version.String())
-				}
-				return &clientSwaggerSchema{
-					c:        client,
-					cacheDir: dir,
-					mapper:   api.RESTMapper,
-				}, nil
-			}
-			return validation.NullSchema{}, nil
-		},
-		DefaultNamespace: func() (string, bool, error) {
-			return clientConfig.Namespace()
-		},
-		Generator: func(name string) (kubectl.Generator, bool) {
-			generator, ok := generators[name]
-			return generator, ok
-		},
-		CanBeExposed: func(kind string) error {
-			if kind != "ReplicationController" && kind != "Service" && kind != "Pod" {
-				return fmt.Errorf("invalid resource provided: %v, only a replication controller, service or pod is accepted", kind)
-			}
-			return nil
-		},
+	return &factory{
+		ClientAccessFactory:  clientAccessFactory,
+		ObjectMappingFactory: objectMappingFactory,
+		BuilderFactory:       builderFactory,
 	}
 }
 
-// BindFlags adds any flags that are common to all kubectl sub commands.
-func (f *Factory) BindFlags(flags *pflag.FlagSet) {
-	// any flags defined by external projects (not part of pflags)
-	flags.AddGoFlagSet(flag.CommandLine)
+// GetFirstPod returns a pod matching the namespace and label selector
+// and the number of all pods that match the label selector.
+func GetFirstPod(client coreclient.PodsGetter, namespace string, selector labels.Selector, timeout time.Duration, sortBy func([]*v1.Pod) sort.Interface) (*api.Pod, int, error) {
+	options := metav1.ListOptions{LabelSelector: selector.String()}
 
-	// Merge factory's flags
-	flags.AddFlagSet(f.flags)
+	podList, err := client.Pods(namespace).List(options)
+	if err != nil {
+		return nil, 0, err
+	}
+	pods := []*v1.Pod{}
+	for i := range podList.Items {
+		pod := podList.Items[i]
+		externalPod := &v1.Pod{}
+		apiv1.Convert_api_Pod_To_v1_Pod(&pod, externalPod, nil)
+		pods = append(pods, externalPod)
+	}
+	if len(pods) > 0 {
+		sort.Sort(sortBy(pods))
+		internalPod := &api.Pod{}
+		apiv1.Convert_v1_Pod_To_api_Pod(pods[0], internalPod, nil)
+		return internalPod, len(podList.Items), nil
+	}
 
-	// Globally persistent flags across all subcommands.
-	// TODO Change flag names to consts to allow safer lookup from subcommands.
-	// TODO Add a verbose flag that turns on glog logging. Probably need a way
-	// to do that automatically for every subcommand.
-	flags.BoolVar(&f.clients.matchVersion, FlagMatchBinaryVersion, false, "Require server version to match client version")
+	// Watch until we observe a pod
+	options.ResourceVersion = podList.ResourceVersion
+	w, err := client.Pods(namespace).Watch(options)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer w.Stop()
 
-	// Normalize all flags that are coming from other packages or pre-configurations
-	// a.k.a. change all "_" to "-". e.g. glog package
-	flags.SetNormalizeFunc(util.WordSepNormalizeFunc)
+	condition := func(event watch.Event) (bool, error) {
+		return event.Type == watch.Added || event.Type == watch.Modified, nil
+	}
+	event, err := watch.Until(timeout, w, condition)
+	if err != nil {
+		return nil, 0, err
+	}
+	pod, ok := event.Object.(*api.Pod)
+	if !ok {
+		return nil, 0, fmt.Errorf("%#v is not a pod event", event)
+	}
+	return pod, 1, nil
+}
+
+func makePortsString(ports []api.ServicePort, useNodePort bool) string {
+	pieces := make([]string, len(ports))
+	for ix := range ports {
+		var port int32
+		if useNodePort {
+			port = ports[ix].NodePort
+		} else {
+			port = ports[ix].Port
+		}
+		pieces[ix] = fmt.Sprintf("%s:%d", strings.ToLower(string(ports[ix].Protocol)), port)
+	}
+	return strings.Join(pieces, ",")
 }
 
 func getPorts(spec api.PodSpec) []string {
 	result := []string{}
 	for _, container := range spec.Containers {
 		for _, port := range container.Ports {
-			result = append(result, strconv.Itoa(port.ContainerPort))
+			result = append(result, strconv.Itoa(int(port.ContainerPort)))
+		}
+	}
+	return result
+}
+
+func getProtocols(spec api.PodSpec) map[string]string {
+	result := make(map[string]string)
+	for _, container := range spec.Containers {
+		for _, port := range container.Ports {
+			result[strconv.Itoa(int(port.ContainerPort))] = string(port.Protocol)
 		}
 	}
 	return result
@@ -292,21 +379,29 @@ func getPorts(spec api.PodSpec) []string {
 func getServicePorts(spec api.ServiceSpec) []string {
 	result := []string{}
 	for _, servicePort := range spec.Ports {
-		result = append(result, strconv.Itoa(servicePort.Port))
+		result = append(result, strconv.Itoa(int(servicePort.Port)))
+	}
+	return result
+}
+
+// Extracts the protocols exposed by a service from the given service spec.
+func getServiceProtocols(spec api.ServiceSpec) map[string]string {
+	result := make(map[string]string)
+	for _, servicePort := range spec.Ports {
+		result[strconv.Itoa(int(servicePort.Port))] = string(servicePort.Protocol)
 	}
 	return result
 }
 
 type clientSwaggerSchema struct {
-	c        *client.Client
+	c        restclient.Interface
 	cacheDir string
-	mapper   meta.RESTMapper
 }
 
 const schemaFileName = "schema.json"
 
 type schemaClient interface {
-	Get() *client.Request
+	Get() *restclient.Request
 }
 
 func recursiveSplit(dir string) []string {
@@ -349,6 +444,7 @@ func writeSchemaFile(schemaData []byte, cacheDir, cacheFile, prefix, groupVersio
 	if _, err := io.Copy(tmpFile, bytes.NewBuffer(schemaData)); err != nil {
 		return err
 	}
+	glog.V(4).Infof("Writing swagger cache (dir %v) file %v (from %v)", cacheDir, cacheFile, tmpFile.Name())
 	if err := os.Link(tmpFile.Name(), cacheFile); err != nil {
 		// If we can't write due to file existing, or permission problems, keep going.
 		if os.IsExist(err) || os.IsPermission(err) {
@@ -359,8 +455,9 @@ func writeSchemaFile(schemaData []byte, cacheDir, cacheFile, prefix, groupVersio
 	return nil
 }
 
-func getSchemaAndValidate(c schemaClient, data []byte, prefix, groupVersion, cacheDir string) (err error) {
+func getSchemaAndValidate(c schemaClient, data []byte, prefix, groupVersion, cacheDir string, delegate validation.Schema) (err error) {
 	var schemaData []byte
+	var firstSeen bool
 	fullDir, err := substituteUserHome(cacheDir)
 	if err != nil {
 		return err
@@ -373,162 +470,67 @@ func getSchemaAndValidate(c schemaClient, data []byte, prefix, groupVersion, cac
 		}
 	}
 	if schemaData == nil {
-		schemaData, err = c.Get().
-			AbsPath("/swaggerapi", prefix, groupVersion).
-			Do().
-			Raw()
+		firstSeen = true
+		schemaData, err = downloadSchemaAndStore(c, cacheDir, fullDir, cacheFile, prefix, groupVersion)
 		if err != nil {
 			return err
 		}
-		if len(cacheDir) != 0 {
-			if err := writeSchemaFile(schemaData, fullDir, cacheFile, prefix, groupVersion); err != nil {
-				return err
-			}
-		}
 	}
-	schema, err := validation.NewSwaggerSchemaFromBytes(schemaData)
+	schema, err := validation.NewSwaggerSchemaFromBytes(schemaData, delegate)
 	if err != nil {
 		return err
 	}
-	return schema.ValidateBytes(data)
+	err = schema.ValidateBytes(data)
+	if _, ok := err.(validation.TypeNotFoundError); ok && !firstSeen {
+		// As a temporary hack, kubectl would re-get the schema if validation
+		// fails for type not found reason.
+		// TODO: runtime-config settings needs to make into the file's name
+		schemaData, err = downloadSchemaAndStore(c, cacheDir, fullDir, cacheFile, prefix, groupVersion)
+		if err != nil {
+			return err
+		}
+		schema, err := validation.NewSwaggerSchemaFromBytes(schemaData, delegate)
+		if err != nil {
+			return err
+		}
+		return schema.ValidateBytes(data)
+	}
+
+	return err
+}
+
+// Download swagger schema from apiserver and store it to file.
+func downloadSchemaAndStore(c schemaClient, cacheDir, fullDir, cacheFile, prefix, groupVersion string) (schemaData []byte, err error) {
+	schemaData, err = c.Get().
+		AbsPath("/swaggerapi", prefix, groupVersion).
+		Do().
+		Raw()
+	if err != nil {
+		return
+	}
+	if len(cacheDir) != 0 {
+		if err = writeSchemaFile(schemaData, fullDir, cacheFile, prefix, groupVersion); err != nil {
+			return
+		}
+	}
+	return
 }
 
 func (c *clientSwaggerSchema) ValidateBytes(data []byte) error {
-	version, kind, err := runtime.UnstructuredJSONScheme.DataVersionAndKind(data)
+	gvk, err := json.DefaultMetaFactory.Interpret(data)
 	if err != nil {
 		return err
 	}
-	if ok := registered.IsRegisteredAPIVersion(version); !ok {
-		return fmt.Errorf("API version %q isn't supported, only supports API versions %q", version, registered.RegisteredVersions)
-	}
-	resource, _ := meta.KindToResource(kind, false)
-	group, err := c.mapper.GroupForResource(resource)
-	if err != nil {
-		return fmt.Errorf("could not find api group for %s: %v", kind, err)
-	}
-	if group == "experimental" {
-		if c.c.ExperimentalClient == nil {
-			return errors.New("unable to validate: no experimental client")
-		}
-		return getSchemaAndValidate(c.c.ExperimentalClient.RESTClient, data, "apis/", version, c.cacheDir)
-	}
-	return getSchemaAndValidate(c.c.RESTClient, data, "api", version, c.cacheDir)
-}
-
-// DefaultClientConfig creates a clientcmd.ClientConfig with the following hierarchy:
-//   1.  Use the kubeconfig builder.  The number of merges and overrides here gets a little crazy.  Stay with me.
-//       1.  Merge together the kubeconfig itself.  This is done with the following hierarchy rules:
-//           1.  CommandLineLocation - this parsed from the command line, so it must be late bound.  If you specify this,
-//               then no other kubeconfig files are merged.  This file must exist.
-//           2.  If $KUBECONFIG is set, then it is treated as a list of files that should be merged.
-//	     3.  HomeDirectoryLocation
-//           Empty filenames are ignored.  Files with non-deserializable content produced errors.
-//           The first file to set a particular value or map key wins and the value or map key is never changed.
-//           This means that the first file to set CurrentContext will have its context preserved.  It also means
-//           that if two files specify a "red-user", only values from the first file's red-user are used.  Even
-//           non-conflicting entries from the second file's "red-user" are discarded.
-//       2.  Determine the context to use based on the first hit in this chain
-//           1.  command line argument - again, parsed from the command line, so it must be late bound
-//           2.  CurrentContext from the merged kubeconfig file
-//           3.  Empty is allowed at this stage
-//       3.  Determine the cluster info and auth info to use.  At this point, we may or may not have a context.  They
-//           are built based on the first hit in this chain.  (run it twice, once for auth, once for cluster)
-//           1.  command line argument
-//           2.  If context is present, then use the context value
-//           3.  Empty is allowed
-//       4.  Determine the actual cluster info to use.  At this point, we may or may not have a cluster info.  Build
-//           each piece of the cluster info based on the chain:
-//           1.  command line argument
-//           2.  If cluster info is present and a value for the attribute is present, use it.
-//           3.  If you don't have a server location, bail.
-//       5.  Auth info is build using the same rules as cluster info, EXCEPT that you can only have one authentication
-//           technique per auth info.  The following conditions result in an error:
-//           1.  If there are two conflicting techniques specified from the command line, fail.
-//           2.  If the command line does not specify one, and the auth info has conflicting techniques, fail.
-//           3.  If the command line specifies one and the auth info specifies another, honor the command line technique.
-//   2.  Use default values and potentially prompt for auth information
-//
-//   However, if it appears that we're running in a kubernetes cluster
-//   container environment, then run with the auth info kubernetes mounted for
-//   us. Specifically:
-//     The env vars KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT are
-//     set, and the file /var/run/secrets/kubernetes.io/serviceaccount/token
-//     exists and is not a directory.
-func DefaultClientConfig(flags *pflag.FlagSet) clientcmd.ClientConfig {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	flags.StringVar(&loadingRules.ExplicitPath, "kubeconfig", "", "Path to the kubeconfig file to use for CLI requests.")
-
-	overrides := &clientcmd.ConfigOverrides{}
-	flagNames := clientcmd.RecommendedConfigOverrideFlags("")
-	// short flagnames are disabled by default.  These are here for compatibility with existing scripts
-	flagNames.ClusterOverrideFlags.APIServer.ShortName = "s"
-
-	clientcmd.BindOverrideFlags(overrides, flags, flagNames)
-	clientConfig := clientcmd.NewInteractiveDeferredLoadingClientConfig(loadingRules, overrides, os.Stdin)
-
-	return clientConfig
-}
-
-// PrintObject prints an api object given command line flags to modify the output format
-func (f *Factory) PrintObject(cmd *cobra.Command, obj runtime.Object, out io.Writer) error {
-	mapper, _ := f.Object()
-	_, kind, err := api.Scheme.ObjectVersionAndKind(obj)
-	if err != nil {
-		return err
+	if ok := api.Registry.IsEnabledVersion(gvk.GroupVersion()); !ok {
+		// if we don't have this in our scheme, just skip validation because its an object we don't recognize
+		return nil
 	}
 
-	mapping, err := mapper.RESTMapping(kind)
-	if err != nil {
-		return err
-	}
+	switch gvk.Group {
+	case api.GroupName:
+		return getSchemaAndValidate(c.c, data, "api", gvk.GroupVersion().String(), c.cacheDir, c)
 
-	printer, err := f.PrinterForMapping(cmd, mapping, false)
-	if err != nil {
-		return err
+	default:
+		return getSchemaAndValidate(c.c, data, "apis/", gvk.GroupVersion().String(), c.cacheDir, c)
 	}
-	return printer.PrintObj(obj, out)
-}
-
-// PrinterForMapping returns a printer suitable for displaying the provided resource type.
-// Requires that printer flags have been added to cmd (see AddPrinterFlags).
-func (f *Factory) PrinterForMapping(cmd *cobra.Command, mapping *meta.RESTMapping, withNamespace bool) (kubectl.ResourcePrinter, error) {
-	printer, ok, err := PrinterForCommand(cmd)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		clientConfig, err := f.ClientConfig()
-		if err != nil {
-			return nil, err
-		}
-		defaultVersion := clientConfig.Version
-
-		version := OutputVersion(cmd, defaultVersion)
-		if len(version) == 0 {
-			version = mapping.APIVersion
-		}
-		if len(version) == 0 {
-			return nil, fmt.Errorf("you must specify an output-version when using this output format")
-		}
-		printer = kubectl.NewVersionedPrinter(printer, mapping.ObjectConvertor, version, mapping.APIVersion)
-	} else {
-		// Some callers do not have "label-columns" so we can't use the GetFlagStringSlice() helper
-		columnLabel, err := cmd.Flags().GetStringSlice("label-columns")
-		if err != nil {
-			columnLabel = []string{}
-		}
-		printer, err = f.Printer(mapping, GetFlagBool(cmd, "no-headers"), withNamespace, GetWideFlag(cmd), GetFlagBool(cmd, "show-all"), columnLabel)
-		if err != nil {
-			return nil, err
-		}
-		printer = maybeWrapSortingPrinter(cmd, printer)
-	}
-	return printer, nil
-}
-
-// ClientMapperForCommand returns a ClientMapper for the factory.
-func (f *Factory) ClientMapperForCommand() resource.ClientMapper {
-	return resource.ClientMapperFunc(func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
-		return f.RESTClient(mapping)
-	})
 }

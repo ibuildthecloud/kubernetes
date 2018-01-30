@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,121 +18,146 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
-	"runtime"
-	"time"
 
-	docker "github.com/fsouza/go-dockerclient"
-	kubeletapp "k8s.io/kubernetes/cmd/kubelet/app"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/util/flag"
+	clientgoclientset "k8s.io/client-go/kubernetes"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/api"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
-	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/kubelet/dockertools"
-	"k8s.io/kubernetes/pkg/util"
-	"k8s.io/kubernetes/pkg/volume/empty_dir"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
+	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
+	"k8s.io/kubernetes/pkg/kubemark"
+	fakeiptables "k8s.io/kubernetes/pkg/util/iptables/testing"
+	fakesysctl "k8s.io/kubernetes/pkg/util/sysctl/testing"
+	_ "k8s.io/kubernetes/pkg/version/prometheus" // for version metric registration
+	fakeexec "k8s.io/utils/exec/testing"
 
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 )
 
-var (
-	fakeDockerClient dockertools.FakeDockerClient
+type HollowNodeConfig struct {
+	KubeconfigPath      string
+	KubeletPort         int
+	KubeletReadOnlyPort int
+	Morph               string
+	NodeName            string
+	ServerPort          int
+	ContentType         string
+	UseRealProxier      bool
+}
 
-	apiServer           string
-	kubeconfigPath      string
-	kubeletPort         int
-	kubeletReadOnlyPort int
-	nodeName            string
-	serverPort          int
+const (
+	maxPods     = 110
+	podsPerCore = 0
 )
 
-func addFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&apiServer, "server", "", "API server IP.")
-	fs.StringVar(&kubeconfigPath, "kubeconfig", "/kubeconfig/kubeconfig", "Path to kubeconfig file.")
-	fs.IntVar(&kubeletPort, "kubelet-port", 10250, "Port on which HollowKubelet should be listening.")
-	fs.IntVar(&kubeletReadOnlyPort, "kubelet-read-only-port", 10255, "Read-only port on which Kubelet is listening.")
-	fs.StringVar(&nodeName, "name", "fake-node", "Name of this Hollow Node.")
-	fs.IntVar(&serverPort, "api-server-port", 443, "Port on which API server is listening.")
+var knownMorphs = sets.NewString("kubelet", "proxy")
+
+func (c *HollowNodeConfig) addFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&c.KubeconfigPath, "kubeconfig", "/kubeconfig/kubeconfig", "Path to kubeconfig file.")
+	fs.IntVar(&c.KubeletPort, "kubelet-port", 10250, "Port on which HollowKubelet should be listening.")
+	fs.IntVar(&c.KubeletReadOnlyPort, "kubelet-read-only-port", 10255, "Read-only port on which Kubelet is listening.")
+	fs.StringVar(&c.NodeName, "name", "fake-node", "Name of this Hollow Node.")
+	fs.IntVar(&c.ServerPort, "api-server-port", 443, "Port on which API server is listening.")
+	fs.StringVar(&c.Morph, "morph", "", fmt.Sprintf("Specifies into which Hollow component this binary should morph. Allowed values: %v", knownMorphs.List()))
+	fs.StringVar(&c.ContentType, "kube-api-content-type", "application/vnd.kubernetes.protobuf", "ContentType of requests sent to apiserver.")
+	fs.BoolVar(&c.UseRealProxier, "use-real-proxier", true, "Set to true if you want to use real proxier inside hollow-proxy.")
 }
 
-func makeTempDirOrDie(prefix string, baseDir string) string {
-	if baseDir == "" {
-		baseDir = "/tmp"
-	}
-	tempDir, err := ioutil.TempDir(baseDir, prefix)
+func (c *HollowNodeConfig) createClientConfigFromFile() (*restclient.Config, error) {
+	clientConfig, err := clientcmd.LoadFromFile(c.KubeconfigPath)
 	if err != nil {
-		glog.Fatalf("Can't make a temp rootdir: %v", err)
+		return nil, fmt.Errorf("error while loading kubeconfig from file %v: %v", c.KubeconfigPath, err)
 	}
-	if err = os.MkdirAll(tempDir, 0750); err != nil {
-		glog.Fatalf("Can't mkdir(%q): %v", tempDir, err)
-	}
-	return tempDir
-}
-
-func createClientFromFile(path string) (*client.Client, error) {
-	c, err := clientcmd.LoadFromFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("error while loading kubeconfig from file %v: %v", path, err)
-	}
-	config, err := clientcmd.NewDefaultClientConfig(*c, &clientcmd.ConfigOverrides{}).ClientConfig()
+	config, err := clientcmd.NewDefaultClientConfig(*clientConfig, &clientcmd.ConfigOverrides{}).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("error while creating kubeconfig: %v", err)
 	}
-	client, err := client.New(config)
-	if err != nil {
-		return nil, fmt.Errorf("error while creating client: %v", err)
-	}
-	if client.Timeout == 0 {
-		client.Timeout = 30 * time.Second
-	}
-	return client, nil
+	config.ContentType = c.ContentType
+	config.QPS = 10
+	config.Burst = 20
+	return config, nil
 }
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	addFlags(pflag.CommandLine)
-	util.InitFlags()
+	config := HollowNodeConfig{}
+	config.addFlags(pflag.CommandLine)
+	flag.InitFlags()
 
-	// create a client for Kubelet to communicate with API server.
-	cl, err := createClientFromFile(kubeconfigPath)
-	if err != nil {
-		glog.Fatal("Failed to create a Client. Exiting.")
+	if !knownMorphs.Has(config.Morph) {
+		glog.Fatalf("Unknown morph: %v. Allowed values: %v", config.Morph, knownMorphs.List())
 	}
-	cadvisorInterface := new(cadvisor.Fake)
 
-	testRootDir := makeTempDirOrDie("hollow-kubelet.", "")
-	configFilePath := makeTempDirOrDie("config", testRootDir)
-	glog.Infof("Using %s as root dir for hollow-kubelet", testRootDir)
-	fakeDockerClient.VersionInfo = docker.Env{"ApiVersion=1.18"}
-	fakeDockerClient.ContainerMap = make(map[string]*docker.Container)
-	fakeDockerClient.EnableSleep = true
-	kcfg := kubeletapp.SimpleKubelet(
-		cl,
-		&fakeDockerClient,
-		nodeName,
-		testRootDir,
-		"",        /* manifest-url */
-		"0.0.0.0", /* bind address */
-		uint(kubeletPort),
-		uint(kubeletReadOnlyPort),
-		api.NamespaceDefault,
-		empty_dir.ProbeVolumePlugins(),
-		nil, /* tls-options */
-		cadvisorInterface,
-		configFilePath,
-		nil, /* cloud-provider */
-		kubecontainer.FakeOS{}, /* os-interface */
-		20*time.Second,         /* FileCheckFrequency */
-		20*time.Second,         /* HTTPCheckFrequency */
-		1*time.Minute,          /* MinimumGCAge */
-		10*time.Second,         /* NodeStatusUpdateFrequency */
-		10*time.Second,         /* SyncFrequency */
-		40,                     /* MaxPods */
-	)
-	kubeletapp.RunKubelet(kcfg)
+	// create a client to communicate with API server.
+	clientConfig, err := config.createClientConfigFromFile()
+	if err != nil {
+		glog.Fatalf("Failed to create a ClientConfig: %v. Exiting.", err)
+	}
 
-	select {}
+	clientset, err := clientset.NewForConfig(clientConfig)
+	if err != nil {
+		glog.Fatalf("Failed to create a ClientSet: %v. Exiting.", err)
+	}
+	internalClientset, err := internalclientset.NewForConfig(clientConfig)
+	if err != nil {
+		glog.Fatalf("Failed to create an internal ClientSet: %v. Exiting.", err)
+	}
+
+	if config.Morph == "kubelet" {
+		cadvisorInterface := &cadvisortest.Fake{
+			NodeName: config.NodeName,
+		}
+		containerManager := cm.NewStubContainerManager()
+		fakeDockerClient := libdocker.NewFakeDockerClient().WithTraceDisabled()
+		fakeDockerClient.EnableSleep = true
+
+		hollowKubelet := kubemark.NewHollowKubelet(
+			config.NodeName,
+			clientset,
+			cadvisorInterface,
+			fakeDockerClient,
+			config.KubeletPort,
+			config.KubeletReadOnlyPort,
+			containerManager,
+			maxPods,
+			podsPerCore,
+		)
+		hollowKubelet.Run()
+	}
+
+	if config.Morph == "proxy" {
+		client, err := clientgoclientset.NewForConfig(clientConfig)
+		if err != nil {
+			glog.Fatalf("Failed to create API Server client: %v", err)
+		}
+		iptInterface := fakeiptables.NewFake()
+		sysctl := fakesysctl.NewFake()
+		execer := &fakeexec.FakeExec{}
+		eventBroadcaster := record.NewBroadcaster()
+		recorder := eventBroadcaster.NewRecorder(api.Scheme, v1.EventSource{Component: "kube-proxy", Host: config.NodeName})
+
+		hollowProxy, err := kubemark.NewHollowProxyOrDie(
+			config.NodeName,
+			internalClientset,
+			client.CoreV1(),
+			iptInterface,
+			sysctl,
+			execer,
+			eventBroadcaster,
+			recorder,
+			config.UseRealProxier,
+		)
+		if err != nil {
+			glog.Fatalf("Failed to create hollowProxy instance: %v", err)
+		}
+		hollowProxy.Run()
+	}
 }

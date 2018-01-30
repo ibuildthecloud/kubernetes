@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,94 +18,214 @@ limitations under the License.
 package kubectl
 
 import (
+	"errors"
+	"fmt"
+	"path"
 	"strings"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-const kubectlAnnotationPrefix = "kubectl.kubernetes.io/"
+const (
+	kubectlAnnotationPrefix = "kubectl.kubernetes.io/"
+)
 
 type NamespaceInfo struct {
 	Namespace string
 }
 
-func listOfImages(spec *api.PodSpec) []string {
-	var images []string
-	for _, container := range spec.Containers {
-		images = append(images, container.Image)
-	}
-	return images
+// ResourceShortcuts represents a structure that holds the information how to
+// transition from resource's shortcut to its full name.
+type ResourceShortcuts struct {
+	ShortForm schema.GroupResource
+	LongForm  schema.GroupResource
 }
 
-func makeImageList(spec *api.PodSpec) string {
-	return strings.Join(listOfImages(spec), ",")
+// ResourcesShortcutStatic is the list of short names to their expanded names.
+// Note that the list is ordered by group.
+var ResourcesShortcutStatic = []ResourceShortcuts{
+	// If you add an entry here, please also take a look at pkg/kubectl/cmd/cmd.go
+	// and add an entry to valid_resources when appropriate.
+	{
+		ShortForm: schema.GroupResource{Resource: "cm"},
+		LongForm:  schema.GroupResource{Resource: "configmaps"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "cs"},
+		LongForm:  schema.GroupResource{Resource: "componentstatuses"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "ep"},
+		LongForm:  schema.GroupResource{Resource: "endpoints"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "ev"},
+		LongForm:  schema.GroupResource{Resource: "events"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "limits"},
+		LongForm:  schema.GroupResource{Resource: "limitranges"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "no"},
+		LongForm:  schema.GroupResource{Resource: "nodes"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "ns"},
+		LongForm:  schema.GroupResource{Resource: "namespaces"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "po"},
+		LongForm:  schema.GroupResource{Resource: "pods"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "pvc"},
+		LongForm:  schema.GroupResource{Resource: "persistentvolumeclaims"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "pv"},
+		LongForm:  schema.GroupResource{Resource: "persistentvolumes"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "quota"},
+		LongForm:  schema.GroupResource{Resource: "resourcequotas"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "rc"},
+		LongForm:  schema.GroupResource{Resource: "replicationcontrollers"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "rs"},
+		LongForm:  schema.GroupResource{Resource: "replicasets"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "sa"},
+		LongForm:  schema.GroupResource{Resource: "serviceaccounts"},
+	},
+	{
+		ShortForm: schema.GroupResource{Resource: "svc"},
+		LongForm:  schema.GroupResource{Resource: "services"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "autoscaling", Resource: "hpa"},
+		LongForm:  schema.GroupResource{Group: "autoscaling", Resource: "horizontalpodautoscalers"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "certificates.k8s.io", Resource: "csr"},
+		LongForm:  schema.GroupResource{Group: "certificates.k8s.io", Resource: "certificatesigningrequests"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "policy", Resource: "pdb"},
+		LongForm:  schema.GroupResource{Group: "policy", Resource: "poddisruptionbudgets"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "extensions", Resource: "deploy"},
+		LongForm:  schema.GroupResource{Group: "extensions", Resource: "deployments"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "extensions", Resource: "ds"},
+		LongForm:  schema.GroupResource{Group: "extensions", Resource: "daemonsets"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "extensions", Resource: "hpa"},
+		LongForm:  schema.GroupResource{Group: "extensions", Resource: "horizontalpodautoscalers"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "extensions", Resource: "ing"},
+		LongForm:  schema.GroupResource{Group: "extensions", Resource: "ingresses"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "extensions", Resource: "netpol"},
+		LongForm:  schema.GroupResource{Group: "extensions", Resource: "networkpolicies"},
+	},
+	{
+		ShortForm: schema.GroupResource{Group: "extensions", Resource: "psp"},
+		LongForm:  schema.GroupResource{Group: "extensions", Resource: "podSecurityPolicies"},
+	},
 }
 
-// OutputVersionMapper is a RESTMapper that will prefer mappings that
-// correspond to a preferred output version (if feasible)
-type OutputVersionMapper struct {
-	meta.RESTMapper
-	OutputVersion string
-}
-
-// RESTMapping implements meta.RESTMapper by prepending the output version to the preferred version list.
-func (m OutputVersionMapper) RESTMapping(kind string, versions ...string) (*meta.RESTMapping, error) {
-	preferred := []string{m.OutputVersion}
-	for _, version := range versions {
-		if len(version) > 0 {
-			preferred = append(preferred, version)
+// ResourceShortFormFor looks up for a short form of resource names.
+// TODO: Change the signature of this function so that it can
+// make use of ResourceShortcuts.
+func ResourceShortFormFor(resource string) (string, bool) {
+	var alias string
+	exists := false
+	for _, item := range ResourcesShortcutStatic {
+		if item.LongForm.Resource == resource {
+			alias = item.ShortForm.Resource
+			exists = true
+			break
 		}
 	}
-	// if the caller wants to use the default version list, try with the preferred version, and on
-	// error, use the default behavior.
-	if len(preferred) == 1 {
-		if m, err := m.RESTMapper.RESTMapping(kind, preferred...); err == nil {
-			return m, nil
+	return alias, exists
+}
+
+// ResourceAliases returns the resource shortcuts and plural forms for the given resources.
+func ResourceAliases(rs []string) []string {
+	as := make([]string, 0, len(rs))
+	plurals := make(map[string]struct{}, len(rs))
+	for _, r := range rs {
+		var plural string
+		switch {
+		case r == "endpoints":
+			plural = r // exception. "endpoint" does not exist. Why?
+		case strings.HasSuffix(r, "y"):
+			plural = r[0:len(r)-1] + "ies"
+		case strings.HasSuffix(r, "s"):
+			plural = r + "es"
+		default:
+			plural = r + "s"
 		}
-		preferred = nil
+		as = append(as, plural)
+
+		plurals[plural] = struct{}{}
 	}
-	return m.RESTMapper.RESTMapping(kind, preferred...)
+
+	for _, item := range ResourcesShortcutStatic {
+		if _, found := plurals[item.LongForm.Resource]; found {
+			as = append(as, item.ShortForm.Resource)
+		}
+	}
+	return as
 }
 
-// ShortcutExpander is a RESTMapper that can be used for Kubernetes
-// resources.
-type ShortcutExpander struct {
-	meta.RESTMapper
+// parseFileSource parses the source given. Acceptable formats include:
+//
+// 1.  source-path: the basename will become the key name
+// 2.  source-name=source-path: the source-name will become the key name and source-path is the path to the key file
+//
+// Key names cannot include '='.
+func parseFileSource(source string) (keyName, filePath string, err error) {
+	numSeparators := strings.Count(source, "=")
+	switch {
+	case numSeparators == 0:
+		return path.Base(source), source, nil
+	case numSeparators == 1 && strings.HasPrefix(source, "="):
+		return "", "", fmt.Errorf("key name for file path %v missing.", strings.TrimPrefix(source, "="))
+	case numSeparators == 1 && strings.HasSuffix(source, "="):
+		return "", "", fmt.Errorf("file path for key name %v missing.", strings.TrimSuffix(source, "="))
+	case numSeparators > 1:
+		return "", "", errors.New("Key names or file paths cannot contain '='.")
+	default:
+		components := strings.Split(source, "=")
+		return components[0], components[1], nil
+	}
 }
 
-// VersionAndKindForResource implements meta.RESTMapper. It expands the resource first, then invokes the wrapped
-// mapper.
-func (e ShortcutExpander) VersionAndKindForResource(resource string) (defaultVersion, kind string, err error) {
-	resource = expandResourceShortcut(resource)
-	defaultVersion, kind, err = e.RESTMapper.VersionAndKindForResource(resource)
-	return defaultVersion, kind, err
-}
+// parseLiteralSource parses the source key=val pair into its component pieces.
+// This functionality is distinguished from strings.SplitN(source, "=", 2) since
+// it returns an error in the case of empty keys, values, or a missing equals
+// sign.
+func parseLiteralSource(source string) (keyName, value string, err error) {
+	// leading equal is invalid
+	if strings.Index(source, "=") == 0 {
+		return "", "", fmt.Errorf("invalid literal source %v, expected key=value", source)
+	}
+	// split after the first equal (so values can have the = character)
+	items := strings.SplitN(source, "=", 2)
+	if len(items) != 2 {
+		return "", "", fmt.Errorf("invalid literal source %v, expected key=value", source)
+	}
 
-// expandResourceShortcut will return the expanded version of resource
-// (something that a pkg/api/meta.RESTMapper can understand), if it is
-// indeed a shortcut. Otherwise, will return resource unmodified.
-func expandResourceShortcut(resource string) string {
-	shortForms := map[string]string{
-		// Please keep this alphabetized
-		"cs":     "componentstatuses",
-		"ev":     "events",
-		"ep":     "endpoints",
-		"hpa":    "horizontalpodautoscalers",
-		"limits": "limitranges",
-		"no":     "nodes",
-		"ns":     "namespaces",
-		"po":     "pods",
-		"pv":     "persistentvolumes",
-		"pvc":    "persistentvolumeclaims",
-		"quota":  "resourcequotas",
-		"rc":     "replicationcontrollers",
-		"ds":     "daemonsets",
-		"svc":    "services",
-		"ing":    "ingress",
-	}
-	if expanded, ok := shortForms[resource]; ok {
-		return expanded
-	}
-	return resource
+	return items[0], items[1], nil
 }

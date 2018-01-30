@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,25 @@ package exec
 import (
 	"testing"
 
-	"k8s.io/kubernetes/pkg/admission"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/registry/rest"
+	core "k8s.io/client-go/testing"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/rest"
-	"k8s.io/kubernetes/pkg/client/unversioned/testclient"
-	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
 )
+
+// newAllowEscalatingExec returns `admission.Interface` that allows execution on
+// "hostIPC", "hostPID" and "privileged".
+func newAllowEscalatingExec() admission.Interface {
+	return &denyExec{
+		Handler:    admission.NewHandler(admission.Connect),
+		hostIPC:    false,
+		hostPID:    false,
+		privileged: false,
+	}
+}
 
 func TestAdmission(t *testing.T) {
 	privPod := validPod("privileged")
@@ -34,10 +47,12 @@ func TestAdmission(t *testing.T) {
 	}
 
 	hostPIDPod := validPod("hostPID")
-	hostPIDPod.Spec.HostPID = true
+	hostPIDPod.Spec.SecurityContext = &api.PodSecurityContext{}
+	hostPIDPod.Spec.SecurityContext.HostPID = true
 
 	hostIPCPod := validPod("hostIPC")
-	hostIPCPod.Spec.HostIPC = true
+	hostIPCPod.Spec.SecurityContext = &api.PodSecurityContext{}
+	hostIPCPod.Spec.SecurityContext.HostIPC = true
 
 	testCases := map[string]struct {
 		pod          *api.Pod
@@ -61,23 +76,31 @@ func TestAdmission(t *testing.T) {
 		},
 	}
 
-	// use the same code as NewDenyEscalatingExec, using the direct object though to allow testAdmission to
-	// inject the client
-	handler := &denyExec{
-		Handler:    admission.NewHandler(admission.Connect),
-		hostIPC:    true,
-		hostPID:    true,
-		privileged: true,
-	}
+	// Get the direct object though to allow testAdmission to inject the client
+	handler := NewDenyEscalatingExec().(*denyExec)
 
 	for _, tc := range testCases {
 		testAdmission(t, tc.pod, handler, tc.shouldAccept)
 	}
 
 	// run with a permissive config and all cases should pass
-	handler.privileged = false
-	handler.hostPID = false
-	handler.hostIPC = false
+	handler = newAllowEscalatingExec().(*denyExec)
+
+	for _, tc := range testCases {
+		testAdmission(t, tc.pod, handler, true)
+	}
+
+	// run against an init container
+	handler = NewDenyEscalatingExec().(*denyExec)
+
+	for _, tc := range testCases {
+		tc.pod.Spec.InitContainers = tc.pod.Spec.Containers
+		tc.pod.Spec.Containers = nil
+		testAdmission(t, tc.pod, handler, tc.shouldAccept)
+	}
+
+	// run with a permissive config and all cases should pass
+	handler = newAllowEscalatingExec().(*denyExec)
 
 	for _, tc := range testCases {
 		testAdmission(t, tc.pod, handler, true)
@@ -85,21 +108,22 @@ func TestAdmission(t *testing.T) {
 }
 
 func testAdmission(t *testing.T, pod *api.Pod, handler *denyExec, shouldAccept bool) {
-	mockClient := &testclient.Fake{}
-	mockClient.AddReactor("get", "pods", func(action testclient.Action) (bool, runtime.Object, error) {
-		if action.(testclient.GetAction).GetName() == pod.Name {
+	mockClient := &fake.Clientset{}
+	mockClient.AddReactor("get", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		if action.(core.GetAction).GetName() == pod.Name {
 			return true, pod, nil
 		}
 		t.Errorf("Unexpected API call: %#v", action)
 		return true, nil, nil
 	})
 
-	handler.client = mockClient
+	handler.SetInternalKubeClientSet(mockClient)
+	admission.Validate(handler)
 
 	// pods/exec
 	{
 		req := &rest.ConnectRequest{Name: pod.Name, ResourcePath: "pods/exec"}
-		err := handler.Admit(admission.NewAttributesRecord(req, "Pod", "test", "name", "pods", "exec", admission.Connect, nil))
+		err := handler.Admit(admission.NewAttributesRecord(req, nil, api.Kind("Pod").WithVersion("version"), "test", "name", api.Resource("pods").WithVersion("version"), "exec", admission.Connect, nil))
 		if shouldAccept && err != nil {
 			t.Errorf("Unexpected error returned from admission handler: %v", err)
 		}
@@ -111,7 +135,7 @@ func testAdmission(t *testing.T, pod *api.Pod, handler *denyExec, shouldAccept b
 	// pods/attach
 	{
 		req := &rest.ConnectRequest{Name: pod.Name, ResourcePath: "pods/attach"}
-		err := handler.Admit(admission.NewAttributesRecord(req, "Pod", "test", "name", "pods", "attach", admission.Connect, nil))
+		err := handler.Admit(admission.NewAttributesRecord(req, nil, api.Kind("Pod").WithVersion("version"), "test", "name", api.Resource("pods").WithVersion("version"), "attach", admission.Connect, nil))
 		if shouldAccept && err != nil {
 			t.Errorf("Unexpected error returned from admission handler: %v", err)
 		}
@@ -130,10 +154,12 @@ func TestDenyExecOnPrivileged(t *testing.T) {
 	}
 
 	hostPIDPod := validPod("hostPID")
-	hostPIDPod.Spec.HostPID = true
+	hostPIDPod.Spec.SecurityContext = &api.PodSecurityContext{}
+	hostPIDPod.Spec.SecurityContext.HostPID = true
 
 	hostIPCPod := validPod("hostIPC")
-	hostIPCPod.Spec.HostIPC = true
+	hostIPCPod.Spec.SecurityContext = &api.PodSecurityContext{}
+	hostIPCPod.Spec.SecurityContext.HostIPC = true
 
 	testCases := map[string]struct {
 		pod          *api.Pod
@@ -157,22 +183,24 @@ func TestDenyExecOnPrivileged(t *testing.T) {
 		},
 	}
 
-	// use the same code as NewDenyExecOnPrivileged, using the direct object though to allow testAdmission to
-	// inject the client
-	handler := &denyExec{
-		Handler:    admission.NewHandler(admission.Connect),
-		hostIPC:    false,
-		hostPID:    false,
-		privileged: true,
-	}
+	// Get the direct object though to allow testAdmission to inject the client
+	handler := NewDenyExecOnPrivileged().(*denyExec)
+
 	for _, tc := range testCases {
+		testAdmission(t, tc.pod, handler, tc.shouldAccept)
+	}
+
+	// test init containers
+	for _, tc := range testCases {
+		tc.pod.Spec.InitContainers = tc.pod.Spec.Containers
+		tc.pod.Spec.Containers = nil
 		testAdmission(t, tc.pod, handler, tc.shouldAccept)
 	}
 }
 
 func validPod(name string) *api.Pod {
 	return &api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: name, Namespace: "test"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test"},
 		Spec: api.PodSpec{
 			Containers: []api.Container{
 				{Name: "ctr1", Image: "image"},

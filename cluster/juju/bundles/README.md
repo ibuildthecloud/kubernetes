@@ -24,7 +24,7 @@ deploy a bundle.
 
 You will need to
 [install the Juju client](https://jujucharms.com/get-started) and
-`juju-quickstart` as pre-requisites.  To deploy the bundle use
+`juju-quickstart` as prerequisites.  To deploy the bundle use
 `juju-quickstart` which runs on Mac OS (`brew install
 juju-quickstart`) or Ubuntu (`apt-get install juju-quickstart`).
 
@@ -59,7 +59,7 @@ Now you should have a running Kubernetes. Run `juju status
 
 For further reading on [Juju Quickstart](https://pypi.python.org/pypi/juju-quickstart)
 
-Go to the [Getting started with Juju guide](https://github.com/kubernetes/kubernetes/blob/master/docs/getting-started-guides/juju.md)
+Go to the [Getting started with Juju guide](https://kubernetes.io/docs/getting-started-guides/ubuntu/installation/#setting-up-kubernetes-with-juju)
 for more information about deploying a development Kubernetes cluster.
 
 ### Using the Kubernetes Client
@@ -81,7 +81,7 @@ via juju ssh:
 
     juju ssh kubernetes-master/0 -t "sudo kubectl get nodes"
 
-You may also SSH to the kuberentes-master unit (`juju ssh kubernetes-master/0`)
+You may also SSH to the kubernetes-master unit (`juju ssh kubernetes-master/0`)
 and call kubectl from the command prompt.
 
 See the
@@ -178,7 +178,7 @@ github.
 
     git clone https://github.com/kubernetes/kubernetes.git
 
-Go to the [Getting started with Juju guide](https://github.com/kubernetes/kubernetes/blob/master/docs/getting-started-guides/juju.md)
+Go to the [Getting started with Juju guide](https://kubernetes.io/docs/getting-started-guides/ubuntu/installation/#setting-up-kubernetes-with-juju)
 for more information about the bundle or charms.
 
 ## How to contribute
@@ -191,7 +191,7 @@ Send us pull requests!  We'll send you a cookie if they include tests and docs.
 The charms and bundles are in the [kubernetes](https://github.com/kubernetes/kubernetes)
 repository in github.
 
- - [kubernetes-master charm on Github](https://github.com/kubernetes/kubernetes/tree/master/cluster/juju/charms/trusty/kubernetes-master)
+ - [kubernetes-master charm on GitHub](https://github.com/kubernetes/kubernetes/tree/master/cluster/juju/charms/trusty/kubernetes-master)
  - [kubernetes charm on GitHub](https://github.com/kubernetes/kubernetes/tree/master/cluster/juju/charms/trusty/kubernetes)
 
 

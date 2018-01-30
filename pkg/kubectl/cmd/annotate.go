@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,206 +20,284 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"strings"
 
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/golang/glog"
 	"github.com/spf13/cobra"
-	"k8s.io/kubernetes/pkg/api"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/json"
+
 	"k8s.io/kubernetes/pkg/kubectl"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
-	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
+	"k8s.io/kubernetes/pkg/printers"
 )
 
 // AnnotateOptions have the data required to perform the annotate operation
 type AnnotateOptions struct {
+	// Filename options
+	resource.FilenameOptions
+
+	// Common user flags
+	overwrite         bool
+	local             bool
+	dryrun            bool
+	all               bool
+	resourceVersion   string
+	selector          string
+	outputFormat      string
+	recordChangeCause bool
+
+	// results of arg parsing
 	resources         []string
 	newAnnotations    map[string]string
 	removeAnnotations []string
-	builder           *resource.Builder
-	filenames         []string
 
-	overwrite       bool
-	all             bool
-	resourceVersion string
+	// Common share fields
+	out io.Writer
 }
 
-const (
-	annotate_long = `Update the annotations on one or more resources.
+var (
+	annotateLong = templates.LongDesc(`
+		Update the annotations on one or more resources.
 
-An annotation is a key/value pair that can hold larger (compared to a label), and possibly not human-readable, data.
-It is intended to store non-identifying auxiliary data, especially data manipulated by tools and system extensions.
-If --overwrite is true, then existing annotations can be overwritten, otherwise attempting to overwrite an annotation will result in an error.
-If --resource-version is specified, then updates will use this resource version, otherwise the existing resource-version will be used.
+		* An annotation is a key/value pair that can hold larger (compared to a label), and possibly not human-readable, data.
+		* It is intended to store non-identifying auxiliary data, especially data manipulated by tools and system extensions.
+		* If --overwrite is true, then existing annotations can be overwritten, otherwise attempting to overwrite an annotation will result in an error.
+		* If --resource-version is specified, then updates will use this resource version, otherwise the existing resource-version will be used.
 
-Possible resources include (case insensitive): pods (po), services (svc),
-replicationcontrollers (rc), nodes (no), events (ev), componentstatuses (cs),
-limitranges (limits), persistentvolumes (pv), persistentvolumeclaims (pvc),
-resourcequotas (quota) or secrets.`
-	annotate_example = `# Update pod 'foo' with the annotation 'description' and the value 'my frontend'.
-# If the same annotation is set multiple times, only the last value will be applied
-$ kubectl annotate pods foo description='my frontend'
+		` + validResources)
 
-# Update a pod identified by type and name in "pod.json"
-$ kubectl annotate -f pod.json description='my frontend'
+	annotateExample = templates.Examples(i18n.T(`
+    # Update pod 'foo' with the annotation 'description' and the value 'my frontend'.
+    # If the same annotation is set multiple times, only the last value will be applied
+    kubectl annotate pods foo description='my frontend'
 
-# Update pod 'foo' with the annotation 'description' and the value 'my frontend running nginx', overwriting any existing value.
-$ kubectl annotate --overwrite pods foo description='my frontend running nginx'
+    # Update a pod identified by type and name in "pod.json"
+    kubectl annotate -f pod.json description='my frontend'
 
-# Update all pods in the namespace
-$ kubectl annotate pods --all description='my frontend running nginx'
+    # Update pod 'foo' with the annotation 'description' and the value 'my frontend running nginx', overwriting any existing value.
+    kubectl annotate --overwrite pods foo description='my frontend running nginx'
 
-# Update pod 'foo' only if the resource is unchanged from version 1.
-$ kubectl annotate pods foo description='my frontend running nginx' --resource-version=1
+    # Update all pods in the namespace
+    kubectl annotate pods --all description='my frontend running nginx'
 
-# Update pod 'foo' by removing an annotation named 'description' if it exists.
-# Does not require the --overwrite flag.
-$ kubectl annotate pods foo description-`
+    # Update pod 'foo' only if the resource is unchanged from version 1.
+    kubectl annotate pods foo description='my frontend running nginx' --resource-version=1
+
+    # Update pod 'foo' by removing an annotation named 'description' if it exists.
+    # Does not require the --overwrite flag.
+    kubectl annotate pods foo description-`))
 )
 
-func NewCmdAnnotate(f *cmdutil.Factory, out io.Writer) *cobra.Command {
+func NewCmdAnnotate(f cmdutil.Factory, out io.Writer) *cobra.Command {
 	options := &AnnotateOptions{}
+
+	// retrieve a list of handled resources from printer as valid args
+	validArgs, argAliases := []string{}, []string{}
+	p, err := f.Printer(nil, printers.PrintOptions{
+		ColumnLabels: []string{},
+	})
+	cmdutil.CheckErr(err)
+	if p != nil {
+		validArgs = p.HandledResources()
+		argAliases = kubectl.ResourceAliases(validArgs)
+	}
 
 	cmd := &cobra.Command{
 		Use:     "annotate [--overwrite] (-f FILENAME | TYPE NAME) KEY_1=VAL_1 ... KEY_N=VAL_N [--resource-version=version]",
-		Short:   "Update the annotations on a resource",
-		Long:    annotate_long,
-		Example: annotate_example,
+		Short:   i18n.T("Update the annotations on a resource"),
+		Long:    annotateLong,
+		Example: annotateExample,
 		Run: func(cmd *cobra.Command, args []string) {
-			if err := options.Complete(f, args); err != nil {
-				cmdutil.CheckErr(err)
+			if err := options.Complete(out, cmd, args); err != nil {
+				cmdutil.CheckErr(cmdutil.UsageErrorf(cmd, "%v", err))
 			}
-			if err := options.Validate(args); err != nil {
-				cmdutil.CheckErr(cmdutil.UsageError(cmd, err.Error()))
+			if err := options.Validate(); err != nil {
+				cmdutil.CheckErr(cmdutil.UsageErrorf(cmd, "%v", err))
 			}
-			if err := options.RunAnnotate(); err != nil {
-				cmdutil.CheckErr(err)
-			}
+			cmdutil.CheckErr(options.RunAnnotate(f, cmd))
 		},
+		ValidArgs:  validArgs,
+		ArgAliases: argAliases,
 	}
-	cmd.Flags().BoolVar(&options.overwrite, "overwrite", false, "If true, allow annotations to be overwritten, otherwise reject annotation updates that overwrite existing annotations.")
-	cmd.Flags().BoolVar(&options.all, "all", false, "select all resources in the namespace of the specified resource types")
-	cmd.Flags().StringVar(&options.resourceVersion, "resource-version", "", "If non-empty, the annotation update will only succeed if this is the current resource-version for the object. Only valid when specifying a single resource.")
-	usage := "Filename, directory, or URL to a file identifying the resource to update the annotation"
-	kubectl.AddJsonFilenameFlag(cmd, &options.filenames, usage)
+	cmdutil.AddPrinterFlags(cmd)
+	cmdutil.AddIncludeUninitializedFlag(cmd)
+	cmd.Flags().Bool("overwrite", false, "If true, allow annotations to be overwritten, otherwise reject annotation updates that overwrite existing annotations.")
+	cmd.Flags().Bool("local", false, "If true, annotation will NOT contact api-server but run locally.")
+	cmd.Flags().StringP("selector", "l", "", "Selector (label query) to filter on, not including uninitialized ones, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2).")
+	cmd.Flags().Bool("all", false, "Select all resources, including uninitialized ones, in the namespace of the specified resource types.")
+	cmd.Flags().String("resource-version", "", i18n.T("If non-empty, the annotation update will only succeed if this is the current resource-version for the object. Only valid when specifying a single resource."))
+	usage := "identifying the resource to update the annotation"
+	cmdutil.AddFilenameOptionFlags(cmd, &options.FilenameOptions, usage)
+	cmdutil.AddDryRunFlag(cmd)
+	cmdutil.AddRecordFlag(cmd)
+	cmdutil.AddInclude3rdPartyFlags(cmd)
+
 	return cmd
 }
 
 // Complete adapts from the command line args and factory to the data required.
-func (o *AnnotateOptions) Complete(f *cmdutil.Factory, args []string) (err error) {
+func (o *AnnotateOptions) Complete(out io.Writer, cmd *cobra.Command, args []string) (err error) {
+	o.out = out
+	o.local = cmdutil.GetFlagBool(cmd, "local")
+	o.overwrite = cmdutil.GetFlagBool(cmd, "overwrite")
+	o.all = cmdutil.GetFlagBool(cmd, "all")
+	o.resourceVersion = cmdutil.GetFlagString(cmd, "resource-version")
+	o.selector = cmdutil.GetFlagString(cmd, "selector")
+	o.outputFormat = cmdutil.GetFlagString(cmd, "output")
+	o.dryrun = cmdutil.GetDryRunFlag(cmd)
+	o.recordChangeCause = cmdutil.GetRecordFlag(cmd)
+
+	// retrieves resource and annotation args from args
+	// also checks args to verify that all resources are specified before annotations
+	resources, annotationArgs, err := cmdutil.GetResourcesAndPairs(args, "annotation")
+	if err != nil {
+		return err
+	}
+	o.resources = resources
+	o.newAnnotations, o.removeAnnotations, err = parseAnnotations(annotationArgs)
+	return err
+}
+
+// Validate checks to the AnnotateOptions to see if there is sufficient information run the command.
+func (o AnnotateOptions) Validate() error {
+	if len(o.resources) < 1 && cmdutil.IsFilenameSliceEmpty(o.Filenames) {
+		return fmt.Errorf("one or more resources must be specified as <resource> <name> or <resource>/<name>")
+	}
+	if len(o.newAnnotations) < 1 && len(o.removeAnnotations) < 1 {
+		return fmt.Errorf("at least one annotation update is required")
+	}
+	return validateAnnotations(o.removeAnnotations, o.newAnnotations)
+}
+
+// RunAnnotate does the work
+func (o AnnotateOptions) RunAnnotate(f cmdutil.Factory, cmd *cobra.Command) error {
 	namespace, enforceNamespace, err := f.DefaultNamespace()
 	if err != nil {
 		return err
 	}
 
-	// retrieves resource and annotation args from args
-	// also checks args to verify that all resources are specified before annotations
-	annotationArgs := []string{}
-	metAnnotaionArg := false
-	for _, s := range args {
-		isAnnotation := strings.Contains(s, "=") || strings.HasSuffix(s, "-")
-		switch {
-		case !metAnnotaionArg && isAnnotation:
-			metAnnotaionArg = true
-			fallthrough
-		case metAnnotaionArg && isAnnotation:
-			annotationArgs = append(annotationArgs, s)
-		case !metAnnotaionArg && !isAnnotation:
-			o.resources = append(o.resources, s)
-		case metAnnotaionArg && !isAnnotation:
-			return fmt.Errorf("all resources must be specified before annotation changes: %s", s)
-		}
-	}
-	if len(o.resources) < 1 && len(o.filenames) == 0 {
-		return fmt.Errorf("one or more resources must be specified as <resource> <name> or <resource>/<name>")
-	}
-	if len(annotationArgs) < 1 {
-		return fmt.Errorf("at least one annotation update is required")
-	}
+	changeCause := f.Command(cmd, false)
 
-	if o.newAnnotations, o.removeAnnotations, err = parseAnnotations(annotationArgs); err != nil {
+	builder, err := f.NewUnstructuredBuilder(!o.local)
+	if err != nil {
 		return err
 	}
 
-	mapper, typer := f.Object()
-	o.builder = resource.NewBuilder(mapper, typer, f.ClientMapperForCommand()).
+	includeUninitialized := cmdutil.ShouldIncludeUninitialized(cmd, false)
+	b := builder.
 		ContinueOnError().
 		NamespaceParam(namespace).DefaultNamespace().
-		FilenameParam(enforceNamespace, o.filenames...).
-		ResourceTypeOrNameArgs(o.all, o.resources...).
-		Flatten().
-		Latest()
+		FilenameParam(enforceNamespace, &o.FilenameOptions).
+		IncludeUninitialized(includeUninitialized).
+		Flatten()
 
-	return nil
-}
-
-// Validate checks to the AnnotateOptions to see if there is sufficient information run the command.
-func (o AnnotateOptions) Validate(args []string) error {
-	if err := validateAnnotations(o.removeAnnotations, o.newAnnotations); err != nil {
-		return err
+	if !o.local {
+		b = b.SelectorParam(o.selector).
+			ResourceTypeOrNameArgs(o.all, o.resources...).
+			Latest()
 	}
-
-	// only apply resource version locking on a single resource
-	if len(o.resources) > 1 && len(o.resourceVersion) > 0 {
-		return fmt.Errorf("--resource-version may only be used with a single resource")
-	}
-
-	return nil
-}
-
-// RunAnnotate does the work
-func (o AnnotateOptions) RunAnnotate() error {
-	r := o.builder.Do()
+	r := b.Do()
 	if err := r.Err(); err != nil {
 		return err
 	}
+
+	var singleItemImpliedResource bool
+	r.IntoSingleItemImplied(&singleItemImpliedResource)
+
+	// only apply resource version locking on a single resource.
+	// we must perform this check after o.builder.Do() as
+	// []o.resources can not not accurately return the proper number
+	// of resources when they are not passed in "resource/name" format.
+	if !singleItemImpliedResource && len(o.resourceVersion) > 0 {
+		return fmt.Errorf("--resource-version may only be used with a single resource")
+	}
+
 	return r.Visit(func(info *resource.Info, err error) error {
 		if err != nil {
 			return err
 		}
-		_, uErr := cmdutil.UpdateObject(info, func(obj runtime.Object) error {
-			err := o.updateAnnotations(obj)
+
+		var outputObj runtime.Object
+		var obj runtime.Object
+
+		obj, err = info.Mapping.ConvertToVersion(info.Object, info.Mapping.GroupVersionKind.GroupVersion())
+		if err != nil {
+			return err
+		}
+
+		if o.dryrun || o.local {
+			if err := o.updateAnnotations(obj); err != nil {
+				return err
+			}
+			outputObj = obj
+		} else {
+			name, namespace := info.Name, info.Namespace
+			oldData, err := json.Marshal(obj)
 			if err != nil {
 				return err
 			}
-			return nil
-		})
-		if uErr != nil {
-			return uErr
+			// If we should record change-cause, add it to new annotations
+			if cmdutil.ContainsChangeCause(info) || o.recordChangeCause {
+				o.newAnnotations[kubectl.ChangeCauseAnnotation] = changeCause
+			}
+			if err := o.updateAnnotations(obj); err != nil {
+				return err
+			}
+			newData, err := json.Marshal(obj)
+			if err != nil {
+				return err
+			}
+			patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
+			createdPatch := err == nil
+			if err != nil {
+				glog.V(2).Infof("couldn't compute patch: %v", err)
+			}
+
+			mapping := info.ResourceMapping()
+			client, err := f.UnstructuredClientForMapping(mapping)
+			if err != nil {
+				return err
+			}
+			helper := resource.NewHelper(client, mapping)
+
+			if createdPatch {
+				outputObj, err = helper.Patch(namespace, name, types.MergePatchType, patchBytes)
+			} else {
+				outputObj, err = helper.Replace(namespace, name, false, obj)
+			}
+			if err != nil {
+				return err
+			}
 		}
+
+		var mapper meta.RESTMapper
+		if o.local {
+			mapper, _ = f.Object()
+		} else {
+			mapper, _, err = f.UnstructuredObject()
+			if err != nil {
+				return err
+			}
+		}
+		if len(o.outputFormat) > 0 {
+			return f.PrintObject(cmd, o.local, mapper, outputObj, o.out)
+		}
+		cmdutil.PrintSuccess(mapper, false, o.out, info.Mapping.Resource, info.Name, o.dryrun, "annotated")
 		return nil
 	})
 }
 
 // parseAnnotations retrieves new and remove annotations from annotation args
 func parseAnnotations(annotationArgs []string) (map[string]string, []string, error) {
-	var invalidBuf bytes.Buffer
-	newAnnotations := map[string]string{}
-	removeAnnotations := []string{}
-	for _, annotationArg := range annotationArgs {
-		if strings.Index(annotationArg, "=") != -1 {
-			parts := strings.SplitN(annotationArg, "=", 2)
-			if len(parts) != 2 || len(parts[1]) == 0 {
-				if invalidBuf.Len() > 0 {
-					invalidBuf.WriteString(", ")
-				}
-				invalidBuf.WriteString(fmt.Sprintf(annotationArg))
-			} else {
-				newAnnotations[parts[0]] = parts[1]
-			}
-		} else if strings.HasSuffix(annotationArg, "-") {
-			removeAnnotations = append(removeAnnotations, annotationArg[:len(annotationArg)-1])
-		} else {
-			if invalidBuf.Len() > 0 {
-				invalidBuf.WriteString(", ")
-			}
-			invalidBuf.WriteString(fmt.Sprintf(annotationArg))
-		}
-	}
-	if invalidBuf.Len() > 0 {
-		return newAnnotations, removeAnnotations, fmt.Errorf("invalid annotation format: %s", invalidBuf.String())
-	}
-
-	return newAnnotations, removeAnnotations, nil
+	return cmdutil.ParsePairs(annotationArgs, "annotation", true)
 }
 
 // validateAnnotations checks the format of annotation args and checks removed annotations aren't in the new annotations map
@@ -241,10 +319,14 @@ func validateAnnotations(removeAnnotations []string, newAnnotations map[string]s
 }
 
 // validateNoAnnotationOverwrites validates that when overwrite is false, to-be-updated annotations don't exist in the object annotation map (yet)
-func validateNoAnnotationOverwrites(meta *api.ObjectMeta, annotations map[string]string) error {
+func validateNoAnnotationOverwrites(accessor metav1.Object, annotations map[string]string) error {
 	var buf bytes.Buffer
 	for key := range annotations {
-		if value, found := meta.Annotations[key]; found {
+		// change-cause annotation can always be overwritten
+		if key == kubectl.ChangeCauseAnnotation {
+			continue
+		}
+		if value, found := accessor.GetAnnotations()[key]; found {
 			if buf.Len() > 0 {
 				buf.WriteString("; ")
 			}
@@ -259,29 +341,31 @@ func validateNoAnnotationOverwrites(meta *api.ObjectMeta, annotations map[string
 
 // updateAnnotations updates annotations of obj
 func (o AnnotateOptions) updateAnnotations(obj runtime.Object) error {
-	meta, err := api.ObjectMetaFor(obj)
+	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return err
 	}
 	if !o.overwrite {
-		if err := validateNoAnnotationOverwrites(meta, o.newAnnotations); err != nil {
+		if err := validateNoAnnotationOverwrites(accessor, o.newAnnotations); err != nil {
 			return err
 		}
 	}
 
-	if meta.Annotations == nil {
-		meta.Annotations = make(map[string]string)
+	annotations := accessor.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
 	}
 
 	for key, value := range o.newAnnotations {
-		meta.Annotations[key] = value
+		annotations[key] = value
 	}
 	for _, annotation := range o.removeAnnotations {
-		delete(meta.Annotations, annotation)
+		delete(annotations, annotation)
 	}
+	accessor.SetAnnotations(annotations)
 
 	if len(o.resourceVersion) != 0 {
-		meta.ResourceVersion = o.resourceVersion
+		accessor.SetResourceVersion(o.resourceVersion)
 	}
 	return nil
 }

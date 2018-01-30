@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2017 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/cmd/km/hyperkube.go
 package main
 
 import (
@@ -26,12 +24,15 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
-	"runtime"
-
-	"k8s.io/kubernetes/pkg/util"
-	"k8s.io/kubernetes/pkg/version/verflag"
 
 	"github.com/spf13/pflag"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/server"
+	utilflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/apiserver/pkg/util/logs"
+	utiltemplate "k8s.io/kubernetes/pkg/util/template"
+	"k8s.io/kubernetes/pkg/version/verflag"
 )
 
 // HyperKube represents a single binary that can morph/manage into multiple
@@ -40,10 +41,11 @@ type HyperKube struct {
 	Name string // The executable name, used for help and soft-link invocation
 	Long string // A long description of the binary.  It will be world wrapped before output.
 
-	servers     []Server
-	baseFlags   *pflag.FlagSet
-	out         io.Writer
-	helpFlagVal bool
+	servers             []Server
+	baseFlags           *pflag.FlagSet
+	out                 io.Writer
+	helpFlagVal         bool
+	makeSymlinksFlagVal bool
 }
 
 // AddServer adds a server to the HyperKube object.
@@ -55,14 +57,14 @@ func (hk *HyperKube) AddServer(s *Server) {
 // FindServer will find a specific server named name.
 func (hk *HyperKube) FindServer(name string) (*Server, error) {
 	for _, s := range hk.servers {
-		if s.Name() == name {
+		if s.Name() == name || s.AlternativeName == name {
 			return &s, nil
 		}
 	}
 	return nil, fmt.Errorf("Server not found: %s", name)
 }
 
-// Servers returns a list of all of the registred servers
+// Servers returns a list of all of the registered servers
 func (hk *HyperKube) Servers() []Server {
 	return hk.servers
 }
@@ -72,8 +74,10 @@ func (hk *HyperKube) Flags() *pflag.FlagSet {
 	if hk.baseFlags == nil {
 		hk.baseFlags = pflag.NewFlagSet(hk.Name, pflag.ContinueOnError)
 		hk.baseFlags.SetOutput(ioutil.Discard)
-		hk.baseFlags.SetNormalizeFunc(util.WordSepNormalizeFunc)
+		hk.baseFlags.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
 		hk.baseFlags.BoolVarP(&hk.helpFlagVal, "help", "h", false, "help for "+hk.Name)
+		hk.baseFlags.BoolVar(&hk.makeSymlinksFlagVal, "make-symlinks", false, "create a symlink for each server in current directory")
+		hk.baseFlags.MarkHidden("make-symlinks") // hide this flag from appearing in servers' usage output
 
 		// These will add all of the "global" flags (defined with both the
 		// flag and pflag packages) to the new flag set we have.
@@ -113,13 +117,13 @@ func (hk *HyperKube) Printf(format string, i ...interface{}) {
 }
 
 // Run the server.  This will pick the appropriate server and run it.
-func (hk *HyperKube) Run(args []string) error {
+func (hk *HyperKube) Run(args []string, stopCh <-chan struct{}) error {
 	// If we are called directly, parse all flags up to the first real
 	// argument.  That should be the server to run.
-	baseCommand := path.Base(args[0])
-	serverName := baseCommand
+	command := args[0]
+	serverName := path.Base(command)
+	args = args[1:]
 	if serverName == hk.Name {
-		args = args[1:]
 
 		baseFlags := hk.Flags()
 		baseFlags.SetInterspersed(false) // Only parse flags up to the next real command
@@ -132,15 +136,18 @@ func (hk *HyperKube) Run(args []string) error {
 			return err
 		}
 
+		if hk.makeSymlinksFlagVal {
+			return hk.MakeSymlinks(command)
+		}
+
 		verflag.PrintAndExitIfRequested()
 
 		args = baseFlags.Args()
 		if len(args) > 0 && len(args[0]) > 0 {
 			serverName = args[0]
-			baseCommand = baseCommand + " " + serverName
 			args = args[1:]
 		} else {
-			err = errors.New("No server specified")
+			err = errors.New("no server specified")
 			hk.Printf("Error: %v\n\n", err)
 			hk.Usage()
 			return err
@@ -166,10 +173,25 @@ func (hk *HyperKube) Run(args []string) error {
 
 	verflag.PrintAndExitIfRequested()
 
-	util.InitLogs()
-	defer util.FlushLogs()
+	logs.InitLogs()
+	defer logs.FlushLogs()
 
-	err = s.Run(s, s.Flags().Args())
+	if !s.RespectsStopCh {
+		// For commands that do not respect the stopCh, we run them in a go
+		// routine and leave them running when stopCh is closed.
+		errCh := make(chan error)
+		go func() {
+			errCh <- s.Run(s, s.Flags().Args(), wait.NeverStop)
+		}()
+		select {
+		case <-stopCh:
+			return errors.New("interrupted") // This error text is ignored.
+		case err = <-errCh:
+			// fall-through
+		}
+	} else {
+		err = s.Run(s, s.Flags().Args(), stopCh)
+	}
 	if err != nil {
 		hk.Println("Error:", err)
 	}
@@ -179,13 +201,10 @@ func (hk *HyperKube) Run(args []string) error {
 
 // RunToExit will run the hyperkube and then call os.Exit with an appropriate exit code.
 func (hk *HyperKube) RunToExit(args []string) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	err := hk.Run(args)
-	if err != nil {
-		fmt.Fprint(os.Stderr, err.Error())
+	stopCh := server.SetupSignalHandler()
+	if err := hk.Run(args, stopCh); err != nil {
 		os.Exit(1)
 	}
-	os.Exit(0)
 }
 
 // Usage will write out a summary for all servers that this binary supports.
@@ -199,7 +218,32 @@ Servers
 {{range .Servers}}
   {{.Name}}
 {{.Long | trim | wrap "    "}}{{end}}
+Call '{{.Name}} --make-symlinks' to create symlinks for each server in the local directory.
 Call '{{.Name}} <server> --help' for help on a specific server.
 `
-	util.ExecuteTemplate(hk.Out(), tt, hk)
+	utiltemplate.ExecuteTemplate(hk.Out(), tt, hk)
+}
+
+// MakeSymlinks will create a symlink for each registered hyperkube server in the local directory.
+func (hk *HyperKube) MakeSymlinks(command string) error {
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	var errs bool
+	for _, s := range hk.servers {
+		link := path.Join(wd, s.Name())
+
+		err := os.Symlink(command, link)
+		if err != nil {
+			errs = true
+			hk.Println(err)
+		}
+	}
+
+	if errs {
+		return errors.New("Error creating one or more symlinks.")
+	}
+	return nil
 }

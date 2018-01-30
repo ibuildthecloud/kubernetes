@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,32 +17,87 @@ limitations under the License.
 package api_test
 
 import (
+	"reflect"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/kubernetes/pkg/api"
 )
 
-// TestFillObjectMetaSystemFields validates that system populated fields are set on an object
-func TestFillObjectMetaSystemFields(t *testing.T) {
-	ctx := api.NewDefaultContext()
-	resource := api.ObjectMeta{}
-	api.FillObjectMetaSystemFields(ctx, &resource)
-	if resource.CreationTimestamp.Time.IsZero() {
-		t.Errorf("resource.CreationTimestamp is zero")
-	} else if len(resource.UID) == 0 {
-		t.Errorf("resource.UID missing")
-	}
-}
+var _ metav1.Object = &metav1.ObjectMeta{}
 
-// TestHasObjectMetaSystemFieldValues validates that true is returned if and only if all fields are populated
-func TestHasObjectMetaSystemFieldValues(t *testing.T) {
-	ctx := api.NewDefaultContext()
-	resource := api.ObjectMeta{}
-	if api.HasObjectMetaSystemFieldValues(&resource) {
-		t.Errorf("the resource does not have all fields yet populated, but incorrectly reports it does")
-	}
-	api.FillObjectMetaSystemFields(ctx, &resource)
-	if !api.HasObjectMetaSystemFieldValues(&resource) {
-		t.Errorf("the resource does have all fields populated, but incorrectly reports it does not")
+func TestAccessorImplementations(t *testing.T) {
+	for _, gv := range api.Registry.EnabledVersions() {
+		internalGV := schema.GroupVersion{Group: gv.Group, Version: runtime.APIVersionInternal}
+		for _, gv := range []schema.GroupVersion{gv, internalGV} {
+			for kind, knownType := range api.Scheme.KnownTypes(gv) {
+				value := reflect.New(knownType)
+				obj := value.Interface()
+				if _, ok := obj.(runtime.Object); !ok {
+					t.Errorf("%v (%v) does not implement runtime.Object", gv.WithKind(kind), knownType)
+				}
+				lm, isLM := obj.(meta.ListMetaAccessor)
+				om, isOM := obj.(metav1.ObjectMetaAccessor)
+				switch {
+				case isLM && isOM:
+					t.Errorf("%v (%v) implements ListMetaAccessor and ObjectMetaAccessor", gv.WithKind(kind), knownType)
+					continue
+				case isLM:
+					m := lm.GetListMeta()
+					if m == nil {
+						t.Errorf("%v (%v) returns nil ListMeta", gv.WithKind(kind), knownType)
+						continue
+					}
+					m.SetResourceVersion("102030")
+					if m.GetResourceVersion() != "102030" {
+						t.Errorf("%v (%v) did not preserve resource version", gv.WithKind(kind), knownType)
+						continue
+					}
+					m.SetSelfLink("102030")
+					if m.GetSelfLink() != "102030" {
+						t.Errorf("%v (%v) did not preserve self link", gv.WithKind(kind), knownType)
+						continue
+					}
+				case isOM:
+					m := om.GetObjectMeta()
+					if m == nil {
+						t.Errorf("%v (%v) returns nil ObjectMeta", gv.WithKind(kind), knownType)
+						continue
+					}
+					m.SetResourceVersion("102030")
+					if m.GetResourceVersion() != "102030" {
+						t.Errorf("%v (%v) did not preserve resource version", gv.WithKind(kind), knownType)
+						continue
+					}
+					m.SetSelfLink("102030")
+					if m.GetSelfLink() != "102030" {
+						t.Errorf("%v (%v) did not preserve self link", gv.WithKind(kind), knownType)
+						continue
+					}
+					labels := map[string]string{"a": "b"}
+					m.SetLabels(labels)
+					if !reflect.DeepEqual(m.GetLabels(), labels) {
+						t.Errorf("%v (%v) did not preserve labels", gv.WithKind(kind), knownType)
+						continue
+					}
+				default:
+					if _, ok := obj.(metav1.ListMetaAccessor); ok {
+						continue
+					}
+					if _, ok := value.Elem().Type().FieldByName("ObjectMeta"); ok {
+						t.Errorf("%v (%v) has ObjectMeta but does not implement ObjectMetaAccessor", gv.WithKind(kind), knownType)
+						continue
+					}
+					if _, ok := value.Elem().Type().FieldByName("ListMeta"); ok {
+						t.Errorf("%v (%v) has ListMeta but does not implement ListMetaAccessor", gv.WithKind(kind), knownType)
+						continue
+					}
+					t.Logf("%v (%v) does not implement ListMetaAccessor or ObjectMetaAccessor", gv.WithKind(kind), knownType)
+				}
+			}
+		}
 	}
 }

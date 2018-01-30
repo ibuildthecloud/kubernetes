@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,94 +18,71 @@ package cmd
 
 import (
 	"bytes"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"reflect"
-	"strconv"
+	stdstrings "strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/rest/fake"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/meta"
 	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/validation"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/client/unversioned/fake"
-	"k8s.io/kubernetes/pkg/kubectl"
+	cmdtesting "k8s.io/kubernetes/pkg/kubectl/cmd/testing"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/resource"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/printers"
+	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
+	"k8s.io/kubernetes/pkg/util/strings"
 )
 
-type internalType struct {
-	Kind       string
-	APIVersion string
-
-	Name string
-}
-
-type externalType struct {
-	Kind       string `json:"kind"`
-	APIVersion string `json:"apiVersion"`
-
-	Name string `json:"name"`
-}
-
-type ExternalType2 struct {
-	Kind       string `json:"kind"`
-	APIVersion string `json:"apiVersion"`
-
-	Name string `json:"name"`
-}
-
-func (*internalType) IsAnAPIObject()  {}
-func (*externalType) IsAnAPIObject()  {}
-func (*ExternalType2) IsAnAPIObject() {}
-
-var versionErr = errors.New("not a version")
-
-func versionErrIfFalse(b bool) error {
-	if b {
-		return nil
-	}
-	return versionErr
-}
-
-func newExternalScheme() (*runtime.Scheme, meta.RESTMapper, runtime.Codec) {
-	scheme := runtime.NewScheme()
-	scheme.AddKnownTypeWithName("", "Type", &internalType{})
-	scheme.AddKnownTypeWithName("unlikelyversion", "Type", &externalType{})
-	//This tests that kubectl will not confuse the external scheme with the internal scheme, even when they accidentally have versions of the same name.
-	scheme.AddKnownTypeWithName(testapi.Default.Version(), "Type", &ExternalType2{})
-
-	codec := runtime.CodecFor(scheme, "unlikelyversion")
-	validVersion := testapi.Default.Version()
-	mapper := meta.NewDefaultRESTMapper("apitest", []string{"unlikelyversion", validVersion}, func(version string) (*meta.VersionInterfaces, error) {
-		return &meta.VersionInterfaces{
-			Codec:            runtime.CodecFor(scheme, version),
-			ObjectConvertor:  scheme,
-			MetadataAccessor: meta.NewAccessor(),
-		}, versionErrIfFalse(version == validVersion || version == "unlikelyversion")
+func initTestErrorHandler(t *testing.T) {
+	cmdutil.BehaviorOnFatal(func(str string, code int) {
+		t.Errorf("Error running command (exit code %d): %s", code, str)
 	})
-	for _, version := range []string{"unlikelyversion", validVersion} {
-		for kind := range scheme.KnownTypes(version) {
-			mixedCase := false
-			scope := meta.RESTScopeNamespace
-			mapper.Add(scope, kind, version, mixedCase)
-		}
-	}
+}
 
-	return scheme, mapper, codec
+func defaultHeader() http.Header {
+	header := http.Header{}
+	header.Set("Content-Type", runtime.ContentTypeJSON)
+	return header
+}
+
+func defaultClientConfig() *restclient.Config {
+	return &restclient.Config{
+		APIPath: "/api",
+		ContentConfig: restclient.ContentConfig{
+			NegotiatedSerializer: api.Codecs,
+			ContentType:          runtime.ContentTypeJSON,
+			GroupVersion:         &api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		},
+	}
+}
+
+func defaultClientConfigForVersion(version *schema.GroupVersion) *restclient.Config {
+	return &restclient.Config{
+		APIPath: "/api",
+		ContentConfig: restclient.ContentConfig{
+			NegotiatedSerializer: api.Codecs,
+			ContentType:          runtime.ContentTypeJSON,
+			GroupVersion:         version,
+		},
+	}
 }
 
 type testPrinter struct {
-	Objects []runtime.Object
-	Err     error
+	Objects        []runtime.Object
+	Err            error
+	GenericPrinter bool
 }
 
 func (t *testPrinter) PrintObj(obj runtime.Object, out io.Writer) error {
@@ -119,133 +96,37 @@ func (t *testPrinter) HandledResources() []string {
 	return []string{}
 }
 
+func (t *testPrinter) AfterPrint(output io.Writer, res string) error {
+	return nil
+}
+
+func (t *testPrinter) IsGeneric() bool {
+	return t.GenericPrinter
+}
+
 type testDescriber struct {
 	Name, Namespace string
+	Settings        printers.DescriberSettings
 	Output          string
 	Err             error
 }
 
-func (t *testDescriber) Describe(namespace, name string) (output string, err error) {
+func (t *testDescriber) Describe(namespace, name string, describerSettings printers.DescriberSettings) (output string, err error) {
 	t.Namespace, t.Name = namespace, name
+	t.Settings = describerSettings
 	return t.Output, t.Err
-}
-
-type testFactory struct {
-	Mapper       meta.RESTMapper
-	Typer        runtime.ObjectTyper
-	Client       kubectl.RESTClient
-	Describer    kubectl.Describer
-	Printer      kubectl.ResourcePrinter
-	Validator    validation.Schema
-	Namespace    string
-	ClientConfig *client.Config
-	Err          error
-}
-
-func NewTestFactory() (*cmdutil.Factory, *testFactory, runtime.Codec) {
-	scheme, mapper, codec := newExternalScheme()
-	t := &testFactory{
-		Validator: validation.NullSchema{},
-		Mapper:    mapper,
-		Typer:     scheme,
-	}
-	return &cmdutil.Factory{
-		Object: func() (meta.RESTMapper, runtime.ObjectTyper) {
-			return t.Mapper, t.Typer
-		},
-		RESTClient: func(*meta.RESTMapping) (resource.RESTClient, error) {
-			return t.Client, t.Err
-		},
-		Describer: func(*meta.RESTMapping) (kubectl.Describer, error) {
-			return t.Describer, t.Err
-		},
-		Printer: func(mapping *meta.RESTMapping, noHeaders, withNamespace bool, wide bool, showAll bool, columnLabels []string) (kubectl.ResourcePrinter, error) {
-			return t.Printer, t.Err
-		},
-		Validator: func(validate bool, cacheDir string) (validation.Schema, error) {
-			return t.Validator, t.Err
-		},
-		DefaultNamespace: func() (string, bool, error) {
-			return t.Namespace, false, t.Err
-		},
-		ClientConfig: func() (*client.Config, error) {
-			return t.ClientConfig, t.Err
-		},
-	}, t, codec
-}
-
-func NewMixedFactory(apiClient resource.RESTClient) (*cmdutil.Factory, *testFactory, runtime.Codec) {
-	f, t, c := NewTestFactory()
-	f.Object = func() (meta.RESTMapper, runtime.ObjectTyper) {
-		return meta.MultiRESTMapper{t.Mapper, testapi.Default.RESTMapper()}, runtime.MultiObjectTyper{t.Typer, api.Scheme}
-	}
-	f.RESTClient = func(m *meta.RESTMapping) (resource.RESTClient, error) {
-		if m.ObjectConvertor == api.Scheme {
-			return apiClient, t.Err
-		}
-		return t.Client, t.Err
-	}
-	return f, t, c
-}
-
-func NewAPIFactory() (*cmdutil.Factory, *testFactory, runtime.Codec) {
-	t := &testFactory{
-		Validator: validation.NullSchema{},
-	}
-	generators := map[string]kubectl.Generator{
-		"run/v1":       kubectl.BasicReplicationController{},
-		"run-pod/v1":   kubectl.BasicPod{},
-		"service/v1":   kubectl.ServiceGeneratorV1{},
-		"service/v2":   kubectl.ServiceGeneratorV2{},
-		"service/test": testServiceGenerator{},
-	}
-	f := &cmdutil.Factory{
-		Object: func() (meta.RESTMapper, runtime.ObjectTyper) {
-			return testapi.Default.RESTMapper(), api.Scheme
-		},
-		Client: func() (*client.Client, error) {
-			// Swap out the HTTP client out of the client with the fake's version.
-			fakeClient := t.Client.(*fake.RESTClient)
-			c := client.NewOrDie(t.ClientConfig)
-			c.Client = fakeClient.Client
-			return c, t.Err
-		},
-		RESTClient: func(*meta.RESTMapping) (resource.RESTClient, error) {
-			return t.Client, t.Err
-		},
-		Describer: func(*meta.RESTMapping) (kubectl.Describer, error) {
-			return t.Describer, t.Err
-		},
-		Printer: func(mapping *meta.RESTMapping, noHeaders, withNamespace bool, wide bool, showAll bool, columnLabels []string) (kubectl.ResourcePrinter, error) {
-			return t.Printer, t.Err
-		},
-		Validator: func(validate bool, cacheDir string) (validation.Schema, error) {
-			return t.Validator, t.Err
-		},
-		DefaultNamespace: func() (string, bool, error) {
-			return t.Namespace, false, t.Err
-		},
-		ClientConfig: func() (*client.Config, error) {
-			return t.ClientConfig, t.Err
-		},
-		CanBeExposed: func(kind string) error {
-			if kind != "ReplicationController" && kind != "Service" && kind != "Pod" {
-				return fmt.Errorf("invalid resource provided: %v, only a replication controller, service or pod is accepted", kind)
-			}
-			return nil
-		},
-		Generator: func(name string) (kubectl.Generator, bool) {
-			generator, ok := generators[name]
-			return generator, ok
-		},
-	}
-	rf := cmdutil.NewFactory(nil)
-	f.PodSelectorForObject = rf.PodSelectorForObject
-	return f, t, testapi.Default.Codec()
 }
 
 func objBody(codec runtime.Codec, obj runtime.Object) io.ReadCloser {
 	return ioutil.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(codec, obj))))
+}
+
+func policyObjBody(obj runtime.Object) io.ReadCloser {
+	return ioutil.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(testapi.Policy.Codec(), obj))))
+}
+
+func bytesBody(bodyBytes []byte) io.ReadCloser {
+	return ioutil.NopCloser(bytes.NewReader(bodyBytes))
 }
 
 func stringBody(body string) io.ReadCloser {
@@ -262,7 +143,7 @@ func stringBody(body string) io.ReadCloser {
 //	mapping := &meta.RESTMapping{
 //		APIVersion: version,
 //	}
-//	c, err := f.RESTClient(mapping)
+//	c, err := f.ClientForMapping(mapping)
 //	if err != nil {
 //		t.Errorf("unexpected error: %v", err)
 //	}
@@ -272,26 +153,32 @@ func stringBody(body string) io.ReadCloser {
 //	}
 //}
 
-func ExamplePrintReplicationControllerWithNamespace() {
-	f, tf, codec := NewAPIFactory()
-	tf.Printer = kubectl.NewHumanReadablePrinter(false, true, false, false, []string{})
+func Example_printReplicationControllerWithNamespace() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		WithNamespace: true,
+		ColumnLabels:  []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
 	tf.Client = &fake.RESTClient{
-		Codec:  codec,
-		Client: nil,
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
 	}
 	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
 	ctrl := &api.ReplicationController{
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:              "foo",
 			Namespace:         "beep",
 			Labels:            map[string]string{"foo": "bar"},
-			CreationTimestamp: unversioned.Time{Time: time.Now().AddDate(-10, 0, 0)},
+			CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 		},
 		Spec: api.ReplicationControllerSpec{
 			Replicas: 1,
 			Selector: map[string]string{"foo": "bar"},
 			Template: &api.PodTemplateSpec{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"foo": "bar"},
 				},
 				Spec: api.PodSpec{
@@ -304,29 +191,196 @@ func ExamplePrintReplicationControllerWithNamespace() {
 				},
 			},
 		},
+		Status: api.ReplicationControllerStatus{
+			Replicas:      1,
+			ReadyReplicas: 1,
+		},
 	}
-	err := f.PrintObject(cmd, ctrl, os.Stdout)
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, ctrl, os.Stdout)
 	if err != nil {
 		fmt.Printf("Unexpected error: %v", err)
 	}
 	// Output:
-	// NAMESPACE   CONTROLLER   CONTAINER(S)   IMAGE(S)    SELECTOR   REPLICAS   AGE
-	// beep        foo          foo            someimage   foo=bar    1          10y
+	// NAMESPACE   NAME      DESIRED   CURRENT   READY     AGE
+	// beep        foo       1         1         1         10y
 }
 
-func ExamplePrintPodWithWideFormat() {
-	f, tf, codec := NewAPIFactory()
-	tf.Printer = kubectl.NewHumanReadablePrinter(false, false, true, false, []string{})
+func Example_printMultiContainersReplicationControllerWithWide() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		Wide:         true,
+		ColumnLabels: []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
 	tf.Client = &fake.RESTClient{
-		Codec:  codec,
-		Client: nil,
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
 	}
-	nodeName := "kubernetes-minion-abcd"
+	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
+	ctrl := &api.ReplicationController{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "foo",
+			Labels:            map[string]string{"foo": "bar"},
+			CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
+		},
+		Spec: api.ReplicationControllerSpec{
+			Replicas: 1,
+			Selector: map[string]string{"foo": "bar"},
+			Template: &api.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"foo": "bar"},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name:  "foo",
+							Image: "someimage",
+						},
+						{
+							Name:  "foo2",
+							Image: "someimage2",
+						},
+					},
+				},
+			},
+		},
+		Status: api.ReplicationControllerStatus{
+			Replicas: 1,
+		},
+	}
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, ctrl, os.Stdout)
+	if err != nil {
+		fmt.Printf("Unexpected error: %v", err)
+	}
+	// Output:
+	// NAME      DESIRED   CURRENT   READY     AGE       CONTAINERS   IMAGES                 SELECTOR
+	// foo       1         1         0         10y       foo,foo2     someimage,someimage2   foo=bar
+}
+
+func Example_printReplicationController() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		ColumnLabels: []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
+	tf.Client = &fake.RESTClient{
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
+	}
+	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
+	ctrl := &api.ReplicationController{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "foo",
+			Labels:            map[string]string{"foo": "bar"},
+			CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
+		},
+		Spec: api.ReplicationControllerSpec{
+			Replicas: 1,
+			Selector: map[string]string{"foo": "bar"},
+			Template: &api.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"foo": "bar"},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name:  "foo",
+							Image: "someimage",
+						},
+						{
+							Name:  "foo2",
+							Image: "someimage",
+						},
+					},
+				},
+			},
+		},
+		Status: api.ReplicationControllerStatus{
+			Replicas: 1,
+		},
+	}
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, ctrl, os.Stdout)
+	if err != nil {
+		fmt.Printf("Unexpected error: %v", err)
+	}
+	// Output:
+	// NAME      DESIRED   CURRENT   READY     AGE
+	// foo       1         1         0         10y
+}
+
+func Example_printPodWithWideFormat() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		Wide:         true,
+		ColumnLabels: []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
+	tf.Client = &fake.RESTClient{
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
+	}
+	nodeName := "kubernetes-node-abcd"
 	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
 	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:              "test1",
-			CreationTimestamp: unversioned.Time{Time: time.Now().AddDate(-10, 0, 0)},
+			CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
+		},
+		Spec: api.PodSpec{
+			Containers: make([]api.Container, 2),
+			NodeName:   nodeName,
+		},
+		Status: api.PodStatus{
+			Phase: "podPhase",
+			ContainerStatuses: []api.ContainerStatus{
+				{Ready: true, RestartCount: 3, State: api.ContainerState{Running: &api.ContainerStateRunning{}}},
+				{RestartCount: 3},
+			},
+			PodIP: "10.1.1.3",
+		},
+	}
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, pod, os.Stdout)
+	if err != nil {
+		fmt.Printf("Unexpected error: %v", err)
+	}
+	// Output:
+	// NAME      READY     STATUS     RESTARTS   AGE       IP         NODE
+	// test1     1/2       podPhase   6          10y       10.1.1.3   kubernetes-node-abcd
+}
+
+func Example_printPodWithShowLabels() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		ShowLabels:   true,
+		ColumnLabels: []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
+	tf.Client = &fake.RESTClient{
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
+	}
+	nodeName := "kubernetes-node-abcd"
+	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
+	pod := &api.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test1",
+			CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
+			Labels: map[string]string{
+				"l1": "key",
+				"l2": "value",
+			},
 		},
 		Spec: api.PodSpec{
 			Containers: make([]api.Container, 2),
@@ -340,23 +394,24 @@ func ExamplePrintPodWithWideFormat() {
 			},
 		},
 	}
-	err := f.PrintObject(cmd, pod, os.Stdout)
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, pod, os.Stdout)
 	if err != nil {
 		fmt.Printf("Unexpected error: %v", err)
 	}
 	// Output:
-	// NAME      READY     STATUS     RESTARTS   AGE       NODE
-	// test1     1/2       podPhase   6          10y       kubernetes-minion-abcd
+	// NAME      READY     STATUS     RESTARTS   AGE       LABELS
+	// test1     1/2       podPhase   6          10y       l1=key,l2=value
 }
 
 func newAllPhasePodList() *api.PodList {
-	nodeName := "kubernetes-minion-abcd"
+	nodeName := "kubernetes-node-abcd"
 	return &api.PodList{
 		Items: []api.Pod{
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test1",
-					CreationTimestamp: unversioned.Time{time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 				},
 				Spec: api.PodSpec{
 					Containers: make([]api.Container, 2),
@@ -371,9 +426,9 @@ func newAllPhasePodList() *api.PodList {
 				},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test2",
-					CreationTimestamp: unversioned.Time{time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 				},
 				Spec: api.PodSpec{
 					Containers: make([]api.Container, 2),
@@ -388,9 +443,9 @@ func newAllPhasePodList() *api.PodList {
 				},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test3",
-					CreationTimestamp: unversioned.Time{time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 				},
 				Spec: api.PodSpec{
 					Containers: make([]api.Container, 2),
@@ -405,9 +460,9 @@ func newAllPhasePodList() *api.PodList {
 				},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test4",
-					CreationTimestamp: unversioned.Time{time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 				},
 				Spec: api.PodSpec{
 					Containers: make([]api.Container, 2),
@@ -422,9 +477,9 @@ func newAllPhasePodList() *api.PodList {
 				},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "test5",
-					CreationTimestamp: unversioned.Time{time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 				},
 				Spec: api.PodSpec{
 					Containers: make([]api.Container, 2),
@@ -441,36 +496,58 @@ func newAllPhasePodList() *api.PodList {
 	}
 }
 
-func ExamplePrintPodHideTerminated() {
-	f, tf, codec := NewAPIFactory()
-	tf.Printer = kubectl.NewHumanReadablePrinter(false, false, false, false, []string{})
+func Example_printPodHideTerminated() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		ColumnLabels: []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
 	tf.Client = &fake.RESTClient{
-		Codec:  codec,
-		Client: nil,
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
 	}
 	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
 	podList := newAllPhasePodList()
-	err := f.PrintObject(cmd, podList, os.Stdout)
-	if err != nil {
-		fmt.Printf("Unexpected error: %v", err)
+	// filter pods
+	filterFuncs := f.DefaultResourceFilterFunc()
+	filterOpts := f.DefaultResourceFilterOptions(cmd, false)
+	_, filteredPodList, errs := cmdutil.FilterResourceList(podList, filterFuncs, filterOpts)
+	if errs != nil {
+		fmt.Printf("Unexpected filter error: %v\n", errs)
+	}
+	for _, pod := range filteredPodList {
+		mapper, _ := f.Object()
+		err := f.PrintObject(cmd, false, mapper, pod, os.Stdout)
+		if err != nil {
+			fmt.Printf("Unexpected error: %v", err)
+		}
 	}
 	// Output:
 	// NAME      READY     STATUS    RESTARTS   AGE
 	// test1     1/2       Pending   6          10y
-	// test2     1/2       Running   6          10y
-	// test5     1/2       Unknown   6          10y
+	// test2     1/2       Running   6         10y
+	// test5     1/2       Unknown   6         10y
 }
 
-func ExamplePrintPodShowAll() {
-	f, tf, codec := NewAPIFactory()
-	tf.Printer = kubectl.NewHumanReadablePrinter(false, false, false, true, []string{})
+func Example_printPodShowAll() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		ShowAll:      true,
+		ColumnLabels: []string{},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
 	tf.Client = &fake.RESTClient{
-		Codec:  codec,
-		Client: nil,
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
 	}
 	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
 	podList := newAllPhasePodList()
-	err := f.PrintObject(cmd, podList, os.Stdout)
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, podList, os.Stdout)
 	if err != nil {
 		fmt.Printf("Unexpected error: %v", err)
 	}
@@ -483,21 +560,27 @@ func ExamplePrintPodShowAll() {
 	// test5     1/2       Unknown     6          10y
 }
 
-func ExamplePrintServiceWithNamespacesAndLabels() {
-	f, tf, codec := NewAPIFactory()
-	tf.Printer = kubectl.NewHumanReadablePrinter(false, true, false, false, []string{"l1"})
+func Example_printServiceWithNamespacesAndLabels() {
+	f, tf, _, ns := cmdtesting.NewAPIFactory()
+	p := printers.NewHumanReadablePrinter(nil, nil, printers.PrintOptions{
+		WithNamespace: true,
+		ColumnLabels:  []string{"l1"},
+	})
+	printersinternal.AddHandlers(p)
+	tf.Printer = p
 	tf.Client = &fake.RESTClient{
-		Codec:  codec,
-		Client: nil,
+		GroupVersion:         api.Registry.GroupOrDie(api.GroupName).GroupVersion,
+		NegotiatedSerializer: ns,
+		Client:               nil,
 	}
 	cmd := NewCmdRun(f, os.Stdin, os.Stdout, os.Stderr)
 	svc := &api.ServiceList{
 		Items: []api.Service{
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "svc1",
 					Namespace:         "ns1",
-					CreationTimestamp: unversioned.Time{Time: time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 					Labels: map[string]string{
 						"l1": "value",
 					},
@@ -511,14 +594,15 @@ func ExamplePrintServiceWithNamespacesAndLabels() {
 						"s": "magic",
 					},
 					ClusterIP: "10.1.1.1",
+					Type:      api.ServiceTypeClusterIP,
 				},
 				Status: api.ServiceStatus{},
 			},
 			{
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:              "svc2",
 					Namespace:         "ns2",
-					CreationTimestamp: unversioned.Time{Time: time.Now().AddDate(-10, 0, 0)},
+					CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 					Labels: map[string]string{
 						"l1": "dolla-bill-yall",
 					},
@@ -532,20 +616,22 @@ func ExamplePrintServiceWithNamespacesAndLabels() {
 						"s": "kazam",
 					},
 					ClusterIP: "10.1.1.2",
+					Type:      api.ServiceTypeClusterIP,
 				},
 				Status: api.ServiceStatus{},
 			}},
 	}
-	ld := util.NewLineDelimiter(os.Stdout, "|")
+	ld := strings.NewLineDelimiter(os.Stdout, "|")
 	defer ld.Flush()
-	err := f.PrintObject(cmd, svc, ld)
+	mapper, _ := f.Object()
+	err := f.PrintObject(cmd, false, mapper, svc, ld)
 	if err != nil {
 		fmt.Printf("Unexpected error: %v", err)
 	}
 	// Output:
-	// |NAMESPACE   NAME      CLUSTER_IP   EXTERNAL_IP   PORT(S)           SELECTOR   AGE       L1|
-	// |ns1         svc1      10.1.1.1     unknown       53/UDP,53/TCP     s=magic    10y       value|
-	// |ns2         svc2      10.1.1.2     unknown       80/TCP,8080/TCP   s=kazam    10y       dolla-bill-yall|
+	// |NAMESPACE   NAME      TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)           AGE       L1|
+	// |ns1         svc1      ClusterIP   10.1.1.1     <none>        53/UDP,53/TCP     10y       value|
+	// |ns2         svc2      ClusterIP   10.1.1.2     <none>        80/TCP,8080/TCP   10y       dolla-bill-yall|
 	// ||
 }
 
@@ -575,110 +661,60 @@ func TestNormalizationFuncGlobalExistence(t *testing.T) {
 	}
 }
 
-type testServiceGenerator struct{}
-
-func (testServiceGenerator) ParamNames() []kubectl.GeneratorParam {
-	return []kubectl.GeneratorParam{
-		{"default-name", true},
-		{"name", false},
-		{"port", true},
-		{"labels", false},
-		{"public-ip", false},
-		{"create-external-load-balancer", false},
-		{"type", false},
-		{"protocol", false},
-		{"container-port", false}, // alias of target-port
-		{"target-port", false},
-		{"port-name", false},
-		{"session-affinity", false},
-	}
-}
-
-func (testServiceGenerator) Generate(genericParams map[string]interface{}) (runtime.Object, error) {
-	params := map[string]string{}
-	for key, value := range genericParams {
-		strVal, isString := value.(string)
-		if !isString {
-			return nil, fmt.Errorf("expected string, saw %v for '%s'", value, key)
-		}
-		params[key] = strVal
-	}
-	labelsString, found := params["labels"]
-	var labels map[string]string
-	var err error
-	if found && len(labelsString) > 0 {
-		labels, err = kubectl.ParseLabels(labelsString)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	name, found := params["name"]
-	if !found || len(name) == 0 {
-		name, found = params["default-name"]
-		if !found || len(name) == 0 {
-			return nil, fmt.Errorf("'name' is a required parameter.")
-		}
-	}
-	portString, found := params["port"]
-	if !found {
-		return nil, fmt.Errorf("'port' is a required parameter.")
-	}
-	port, err := strconv.Atoi(portString)
+func genResponseWithJsonEncodedBody(bodyStruct interface{}) (*http.Response, error) {
+	jsonBytes, err := json.Marshal(bodyStruct)
 	if err != nil {
 		return nil, err
 	}
-	servicePortName, found := params["port-name"]
-	if !found {
-		// Leave the port unnamed.
-		servicePortName = ""
-	}
-	service := api.Service{
-		ObjectMeta: api.ObjectMeta{
-			Name:   name,
-			Labels: labels,
-		},
-		Spec: api.ServiceSpec{
-			Ports: []api.ServicePort{
-				{
-					Name:     servicePortName,
-					Port:     port,
-					Protocol: api.Protocol(params["protocol"]),
-				},
-			},
-		},
-	}
-	targetPort, found := params["target-port"]
-	if !found {
-		targetPort, found = params["container-port"]
-	}
-	if found && len(targetPort) > 0 {
-		if portNum, err := strconv.Atoi(targetPort); err != nil {
-			service.Spec.Ports[0].TargetPort = util.NewIntOrStringFromString(targetPort)
-		} else {
-			service.Spec.Ports[0].TargetPort = util.NewIntOrStringFromInt(portNum)
+	return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: bytesBody(jsonBytes)}, nil
+}
+
+func Test_deprecatedAlias(t *testing.T) {
+	var correctCommandCalled bool
+	makeCobraCommand := func() *cobra.Command {
+		cobraCmd := new(cobra.Command)
+		cobraCmd.Use = "print five lines"
+		cobraCmd.Run = func(*cobra.Command, []string) {
+			correctCommandCalled = true
 		}
-	} else {
-		service.Spec.Ports[0].TargetPort = util.NewIntOrStringFromInt(port)
+		return cobraCmd
 	}
-	if params["create-external-load-balancer"] == "true" {
-		service.Spec.Type = api.ServiceTypeLoadBalancer
+
+	original := makeCobraCommand()
+	alias := deprecatedAlias("echo", makeCobraCommand())
+
+	if len(alias.Deprecated) == 0 {
+		t.Error("deprecatedAlias should always have a non-empty .Deprecated")
 	}
-	if len(params["external-ip"]) > 0 {
-		service.Spec.ExternalIPs = []string{params["external-ip"]}
+	if !stdstrings.Contains(alias.Deprecated, "print") {
+		t.Error("deprecatedAlias should give the name of the new function in its .Deprecated field")
 	}
-	if len(params["type"]) != 0 {
-		service.Spec.Type = api.ServiceType(params["type"])
+	if !alias.Hidden {
+		t.Error("deprecatedAlias should never have .Hidden == false (deprecated aliases should be hidden)")
 	}
-	if len(params["session-affinity"]) != 0 {
-		switch api.ServiceAffinity(params["session-affinity"]) {
-		case api.ServiceAffinityNone:
-			service.Spec.SessionAffinity = api.ServiceAffinityNone
-		case api.ServiceAffinityClientIP:
-			service.Spec.SessionAffinity = api.ServiceAffinityClientIP
-		default:
-			return nil, fmt.Errorf("unknown session affinity: %s", params["session-affinity"])
-		}
+
+	if alias.Name() != "echo" {
+		t.Errorf("deprecatedAlias has name %q, expected %q",
+			alias.Name(), "echo")
 	}
-	return &service, nil
+	if original.Name() != "print" {
+		t.Errorf("original command has name %q, expected %q",
+			original.Name(), "print")
+	}
+
+	buffer := new(bytes.Buffer)
+	alias.SetOutput(buffer)
+	alias.Execute()
+	str := buffer.String()
+	if !stdstrings.Contains(str, "deprecated") || !stdstrings.Contains(str, "print") {
+		t.Errorf("deprecation warning %q does not include enough information", str)
+	}
+
+	// It would be nice to test to see that original.Run == alias.Run
+	// Unfortunately Golang does not allow comparing functions. I could do
+	// this with reflect, but that's technically invoking undefined
+	// behavior. Best we can do is make sure that the function is called.
+	if !correctCommandCalled {
+		t.Errorf("original function doesn't appear to have been called by alias")
+	}
 }

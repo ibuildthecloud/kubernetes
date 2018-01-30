@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,10 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
+	"github.com/stretchr/testify/assert"
+
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestEnvVarsToMap(t *testing.T) {
@@ -53,18 +56,18 @@ func TestEnvVarsToMap(t *testing.T) {
 func TestExpandCommandAndArgs(t *testing.T) {
 	cases := []struct {
 		name            string
-		container       *api.Container
+		container       *v1.Container
 		envs            []EnvVar
 		expectedCommand []string
 		expectedArgs    []string
 	}{
 		{
 			name:      "none",
-			container: &api.Container{},
+			container: &v1.Container{},
 		},
 		{
 			name: "command expanded",
-			container: &api.Container{
+			container: &v1.Container{
 				Command: []string{"foo", "$(VAR_TEST)", "$(VAR_TEST2)"},
 			},
 			envs: []EnvVar{
@@ -81,7 +84,7 @@ func TestExpandCommandAndArgs(t *testing.T) {
 		},
 		{
 			name: "args expanded",
-			container: &api.Container{
+			container: &v1.Container{
 				Args: []string{"zap", "$(VAR_TEST)", "$(VAR_TEST2)"},
 			},
 			envs: []EnvVar{
@@ -98,7 +101,7 @@ func TestExpandCommandAndArgs(t *testing.T) {
 		},
 		{
 			name: "both expanded",
-			container: &api.Container{
+			container: &v1.Container{
 				Command: []string{"$(VAR_TEST2)--$(VAR_TEST)", "foo", "$(VAR_TEST3)"},
 				Args:    []string{"foo", "$(VAR_TEST)", "$(VAR_TEST2)"},
 			},
@@ -132,5 +135,174 @@ func TestExpandCommandAndArgs(t *testing.T) {
 			t.Errorf("%v: unexpected args; expected %v, got %v", tc.name, e, a)
 		}
 
+	}
+}
+
+func TestShouldContainerBeRestarted(t *testing.T) {
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "foo",
+			Namespace: "new",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{Name: "no-history"},
+				{Name: "alive"},
+				{Name: "succeed"},
+				{Name: "failed"},
+				{Name: "unknown"},
+			},
+		},
+	}
+	podStatus := &PodStatus{
+		ID:        pod.UID,
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+		ContainerStatuses: []*ContainerStatus{
+			{
+				Name:  "alive",
+				State: ContainerStateRunning,
+			},
+			{
+				Name:     "succeed",
+				State:    ContainerStateExited,
+				ExitCode: 0,
+			},
+			{
+				Name:     "failed",
+				State:    ContainerStateExited,
+				ExitCode: 1,
+			},
+			{
+				Name:     "alive",
+				State:    ContainerStateExited,
+				ExitCode: 2,
+			},
+			{
+				Name:  "unknown",
+				State: ContainerStateUnknown,
+			},
+			{
+				Name:     "failed",
+				State:    ContainerStateExited,
+				ExitCode: 3,
+			},
+		},
+	}
+	policies := []v1.RestartPolicy{
+		v1.RestartPolicyNever,
+		v1.RestartPolicyOnFailure,
+		v1.RestartPolicyAlways,
+	}
+	expected := map[string][]bool{
+		"no-history": {true, true, true},
+		"alive":      {false, false, false},
+		"succeed":    {false, false, true},
+		"failed":     {false, true, true},
+		"unknown":    {true, true, true},
+	}
+	for _, c := range pod.Spec.Containers {
+		for i, policy := range policies {
+			pod.Spec.RestartPolicy = policy
+			e := expected[c.Name][i]
+			r := ShouldContainerBeRestarted(&c, pod, podStatus)
+			if r != e {
+				t.Errorf("Restart for container %q with restart policy %q expected %t, got %t",
+					c.Name, policy, e, r)
+			}
+		}
+	}
+}
+
+func TestHasPrivilegedContainer(t *testing.T) {
+	newBoolPtr := func(b bool) *bool {
+		return &b
+	}
+	tests := map[string]struct {
+		securityContext *v1.SecurityContext
+		expected        bool
+	}{
+		"nil security context": {
+			securityContext: nil,
+			expected:        false,
+		},
+		"nil privileged": {
+			securityContext: &v1.SecurityContext{},
+			expected:        false,
+		},
+		"false privileged": {
+			securityContext: &v1.SecurityContext{Privileged: newBoolPtr(false)},
+			expected:        false,
+		},
+		"true privileged": {
+			securityContext: &v1.SecurityContext{Privileged: newBoolPtr(true)},
+			expected:        true,
+		},
+	}
+
+	for k, v := range tests {
+		pod := &v1.Pod{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{SecurityContext: v.securityContext},
+				},
+			},
+		}
+		actual := HasPrivilegedContainer(pod)
+		if actual != v.expected {
+			t.Errorf("%s expected %t but got %t", k, v.expected, actual)
+		}
+	}
+}
+
+func TestMakePortMappings(t *testing.T) {
+	port := func(name string, protocol v1.Protocol, containerPort, hostPort int32, ip string) v1.ContainerPort {
+		return v1.ContainerPort{
+			Name:          name,
+			Protocol:      protocol,
+			ContainerPort: containerPort,
+			HostPort:      hostPort,
+			HostIP:        ip,
+		}
+	}
+	portMapping := func(name string, protocol v1.Protocol, containerPort, hostPort int, ip string) PortMapping {
+		return PortMapping{
+			Name:          name,
+			Protocol:      protocol,
+			ContainerPort: containerPort,
+			HostPort:      hostPort,
+			HostIP:        ip,
+		}
+	}
+
+	tests := []struct {
+		container            *v1.Container
+		expectedPortMappings []PortMapping
+	}{
+		{
+			&v1.Container{
+				Name: "fooContainer",
+				Ports: []v1.ContainerPort{
+					port("", v1.ProtocolTCP, 80, 8080, "127.0.0.1"),
+					port("", v1.ProtocolTCP, 443, 4343, "192.168.0.1"),
+					port("foo", v1.ProtocolUDP, 555, 5555, ""),
+					// Duplicated, should be ignored.
+					port("foo", v1.ProtocolUDP, 888, 8888, ""),
+					// Duplicated, should be ignored.
+					port("", v1.ProtocolTCP, 80, 8888, ""),
+				},
+			},
+			[]PortMapping{
+				portMapping("fooContainer-TCP:80", v1.ProtocolTCP, 80, 8080, "127.0.0.1"),
+				portMapping("fooContainer-TCP:443", v1.ProtocolTCP, 443, 4343, "192.168.0.1"),
+				portMapping("fooContainer-foo", v1.ProtocolUDP, 555, 5555, ""),
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		actual := MakePortMappings(tt.container)
+		assert.Equal(t, tt.expectedPortMappings, actual, "[%d]", i)
 	}
 }

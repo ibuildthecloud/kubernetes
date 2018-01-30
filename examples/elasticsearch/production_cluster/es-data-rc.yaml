@@ -7,9 +7,6 @@ metadata:
     role: data
 spec:
   replicas: 1
-  selector:
-    component: elasticsearch
-    role: data
   template:
     metadata:
       labels:
@@ -46,5 +43,4 @@ spec:
           name: storage
       volumes:
       - name: storage
-        source:
-          emptyDir: {}
+        emptyDir: {}

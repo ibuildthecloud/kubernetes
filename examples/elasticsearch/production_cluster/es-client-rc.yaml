@@ -7,9 +7,6 @@ metadata:
     role: client
 spec:
   replicas: 1
-  selector:
-    component: elasticsearch
-    role: client
   template:
     metadata:
       labels:
@@ -51,5 +48,4 @@ spec:
           name: storage
       volumes:
       - name: storage
-        source:
-          emptyDir: {}
+        emptyDir: {}

@@ -11,18 +11,24 @@ addon-dir-create:
     - require:
         - file: addon-dir-delete
 
-/etc/kubernetes/addons/namespace.yaml:
-  file.managed:
-    - source: salt://kube-addons/namespace.yaml
-    - user: root
-    - group: root
-    - file_mode: 644
-
 {% if pillar.get('enable_cluster_monitoring', '').lower() == 'influxdb' %}
 /etc/kubernetes/addons/cluster-monitoring/influxdb:
   file.recurse:
     - source: salt://kube-addons/cluster-monitoring/influxdb
     - include_pat: E@(^.+\.yaml$|^.+\.json$)
+    - template: jinja
+    - user: root
+    - group: root
+    - dir_mode: 755
+    - file_mode: 644
+{% endif %}
+
+{% if pillar.get('enable_l7_loadbalancing', '').lower() == 'glbc' %}
+/etc/kubernetes/addons/cluster-loadbalancing/glbc:
+  file.recurse:
+    - source: salt://kube-addons/cluster-loadbalancing/glbc
+    - include_pat: E@(^.+\.yaml$|^.+\.json$)
+    - template: jinja
     - user: root
     - group: root
     - dir_mode: 755
@@ -34,6 +40,19 @@ addon-dir-create:
   file.recurse:
     - source: salt://kube-addons/cluster-monitoring/google
     - include_pat: E@(^.+\.yaml$|^.+\.json$)
+    - template: jinja
+    - user: root
+    - group: root
+    - dir_mode: 755
+    - file_mode: 644
+{% endif %}
+
+{% if pillar.get('enable_cluster_monitoring', '').lower() == 'stackdriver' %}
+/etc/kubernetes/addons/cluster-monitoring/stackdriver:
+  file.recurse:
+    - source: salt://kube-addons/cluster-monitoring/stackdriver
+    - include_pat: E@(^.+\.yaml$|^.+\.json$)
+    - template: jinja
     - user: root
     - group: root
     - dir_mode: 755
@@ -45,6 +64,7 @@ addon-dir-create:
   file.recurse:
     - source: salt://kube-addons/cluster-monitoring/standalone
     - include_pat: E@(^.+\.yaml$|^.+\.json$)
+    - template: jinja
     - user: root
     - group: root
     - dir_mode: 755
@@ -57,6 +77,7 @@ addon-dir-create:
     - source: salt://kube-addons/cluster-monitoring
     - include_pat: E@(^.+\.yaml$|^.+\.json$)
     - exclude_pat: E@(^.+heapster-controller\.yaml$|^.+heapster-controller\.json$)
+    - template: jinja
     - user: root
     - group: root
     - dir_mode: 755
@@ -64,20 +85,47 @@ addon-dir-create:
 {% endif %}
 
 {% if pillar.get('enable_cluster_dns', '').lower() == 'true' %}
-/etc/kubernetes/addons/dns/skydns-svc.yaml:
+/etc/kubernetes/addons/dns/kubedns-svc.yaml:
   file.managed:
-    - source: salt://kube-addons/dns/skydns-svc.yaml.in
+    - source: salt://kube-addons/dns/kubedns-svc.yaml.in
     - template: jinja
     - group: root
     - dir_mode: 755
     - makedirs: True
 
-/etc/kubernetes/addons/dns/skydns-rc.yaml:
+/etc/kubernetes/addons/dns/kubedns-controller.yaml:
   file.managed:
-    - source: salt://kube-addons/dns/skydns-rc.yaml.in
+    - source: salt://kube-addons/dns/kubedns-controller.yaml.in
     - template: jinja
     - group: root
     - dir_mode: 755
+    - makedirs: True
+
+/etc/kubernetes/addons/dns/kubedns-sa.yaml:
+  file.managed:
+    - source: salt://kube-addons/dns/kubedns-sa.yaml
+    - user: root
+    - group: root
+    - file_mode: 644
+    - makedirs: True
+
+/etc/kubernetes/addons/dns/kubedns-cm.yaml:
+  file.managed:
+    - source: salt://kube-addons/dns/kubedns-cm.yaml
+    - user: root
+    - group: root
+    - file_mode: 644
+    - makedirs: True
+{% endif %}
+
+{% if pillar.get('enable_dns_horizontal_autoscaler', '').lower() == 'true'
+   and pillar.get('enable_cluster_dns', '').lower() == 'true' %}
+/etc/kubernetes/addons/dns-horizontal-autoscaler/dns-horizontal-autoscaler.yaml:
+  file.managed:
+    - source: salt://kube-addons/dns-horizontal-autoscaler/dns-horizontal-autoscaler.yaml
+    - user: root
+    - group: root
+    - file_mode: 644
     - makedirs: True
 {% endif %}
 
@@ -118,11 +166,33 @@ addon-dir-create:
 {% endif %}
 
 {% if pillar.get('enable_node_logging', '').lower() == 'true'
-   and pillar.get('logging_destination').lower() == 'elasticsearch'
+   and 'logging_destination' in pillar
    and pillar.get('enable_cluster_logging', '').lower() == 'true' %}
-/etc/kubernetes/addons/fluentd-elasticsearch:
+/etc/kubernetes/addons/fluentd-{{ pillar.get('logging_destination') }}:
   file.recurse:
-    - source: salt://kube-addons/fluentd-elasticsearch
+    - source: salt://kube-addons/fluentd-{{ pillar.get('logging_destination') }}
+    - include_pat: E@^.+\.yaml$
+    - user: root
+    - group: root
+    - dir_mode: 755
+    - file_mode: 644
+{% endif %}
+
+{% if pillar.get('enable_metadata_proxy', '').lower() == 'true' %}
+/etc/kubernetes/addons/metadata-proxy/gce:
+  file.recurse:
+    - source: salt://kube-addons/metadata-proxy/gce
+    - include_pat: E@^.+\.yaml$
+    - user: root
+    - group: root
+    - dir_mode: 755
+    - file_mode: 644
+{% endif %}
+
+{% if pillar.get('enable_pod_security_policy', '').lower() == 'true' %}
+/etc/kubernetes/addons/podsecuritypolicies:
+  file.recurse:
+    - source: salt://kube-addons/podsecuritypolicies
     - include_pat: E@^.+\.yaml$
     - user: root
     - group: root
@@ -131,9 +201,9 @@ addon-dir-create:
 {% endif %}
 
 {% if pillar.get('enable_cluster_ui', '').lower() == 'true' %}
-/etc/kubernetes/addons/kube-ui:
+/etc/kubernetes/addons/dashboard:
   file.recurse:
-    - source: salt://kube-addons/kube-ui
+    - source: salt://kube-addons/dashboard
     - include_pat: E@^.+\.yaml$
     - user: root
     - group: root
@@ -141,59 +211,29 @@ addon-dir-create:
     - file_mode: 644
 {% endif %}
 
-/etc/kubernetes/kube-addons.sh:
+{% if pillar.get('enable_node_problem_detector', '').lower() == 'daemonset' %}
+/etc/kubernetes/addons/node-problem-detector/npd.yaml:
   file.managed:
-    - source: salt://kube-addons/kube-addons.sh
+    - source: salt://kube-addons/node-problem-detector/npd.yaml
     - user: root
     - group: root
-    - mode: 755
-
-/etc/kubernetes/kube-addon-update.sh:
-  file.managed:
-    - source: salt://kube-addons/kube-addon-update.sh
-    - user: root
-    - group: root
-    - mode: 755
-
-{% if pillar.get('is_systemd') %}
-
-{{ pillar.get('systemd_system_path') }}/kube-addons.service:
-  file.managed:
-    - source: salt://kube-addons/kube-addons.service
-    - user: root
-    - group: root
-  cmd.wait:
-    - name: /opt/kubernetes/helpers/services bounce kube-addons
-    - watch:
-      - file: {{ pillar.get('systemd_system_path') }}/kube-addons.service
-
-{% else %}
-
-/etc/init.d/kube-addons:
-  file.managed:
-    - source: salt://kube-addons/initd
-    - user: root
-    - group: root
-    - mode: 755
-
+    - file_mode: 644
+    - makedirs: True
 {% endif %}
 
-# Stop kube-addons service each time salt is executed, just in case
-# there was a modification of addons.
-# Actually, this should be handled by watching file changes, but
-# somehow it doesn't work.
-service-kube-addon-stop:
-  service.dead:
-    - name: kube-addons
+/etc/kubernetes/manifests/kube-addon-manager.yaml:
+  file.managed:
+    - source: salt://kube-addons/kube-addon-manager.yaml
+    - user: root
+    - group: root
+    - mode: 755
 
-kube-addons:
-  service.running:
-    - enable: True
-    - require:
-        - service: service-kube-addon-stop
-    - watch:
-{% if pillar.get('is_systemd') %}
-      - file: {{ pillar.get('systemd_system_path') }}/kube-addons.service
-{% else %}
-      - file: /etc/init.d/kube-addons
+{% if pillar.get('enable_default_storage_class', '').lower() == 'true' and grains['cloud'] is defined and grains['cloud'] in ['aws', 'gce', 'openstack'] %}
+/etc/kubernetes/addons/storage-class/default.yaml:
+  file.managed:
+    - source: salt://kube-addons/storage-class/{{ grains['cloud'] }}/default.yaml
+    - user: root
+    - group: root
+    - mode: 644
+    - makedirs: True
 {% endif %}

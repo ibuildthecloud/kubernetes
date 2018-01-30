@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,62 @@ limitations under the License.
 package api
 
 import (
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/runtime"
+	"os"
+
+	"k8s.io/apimachinery/pkg/apimachinery/announced"
+	"k8s.io/apimachinery/pkg/apimachinery/registered"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
+// GroupFactoryRegistry is the APIGroupFactoryRegistry (overlaps a bit with Registry, see comments in package for details)
+var GroupFactoryRegistry = make(announced.APIGroupFactoryRegistry)
+
+// Registry is an instance of an API registry.  This is an interim step to start removing the idea of a global
+// API registry.
+var Registry = registered.NewOrDie(os.Getenv("KUBE_API_VERSIONS"))
+
 // Scheme is the default instance of runtime.Scheme to which types in the Kubernetes API are already registered.
+// NOTE: If you are copying this file to start a new api group, STOP! Copy the
+// extensions group instead. This Scheme is special and should appear ONLY in
+// the api group, unless you really know what you're doing.
+// TODO(lavalamp): make the above error impossible.
 var Scheme = runtime.NewScheme()
 
-func init() {
-	Scheme.AddKnownTypes("",
+// Codecs provides access to encoding and decoding for the scheme
+var Codecs = serializer.NewCodecFactory(Scheme)
+
+// GroupName is the group name use in this package
+const GroupName = ""
+
+// SchemeGroupVersion is group version used to register these objects
+var SchemeGroupVersion = schema.GroupVersion{Group: GroupName, Version: runtime.APIVersionInternal}
+
+// ParameterCodec handles versioning of objects that are converted to query parameters.
+var ParameterCodec = runtime.NewParameterCodec(Scheme)
+
+// Kind takes an unqualified kind and returns a Group qualified GroupKind
+func Kind(kind string) schema.GroupKind {
+	return SchemeGroupVersion.WithKind(kind).GroupKind()
+}
+
+// Resource takes an unqualified resource and returns a Group qualified GroupResource
+func Resource(resource string) schema.GroupResource {
+	return SchemeGroupVersion.WithResource(resource).GroupResource()
+}
+
+var (
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+
+func addKnownTypes(scheme *runtime.Scheme) error {
+	if err := scheme.AddIgnoredConversionType(&metav1.TypeMeta{}, &metav1.TypeMeta{}); err != nil {
+		return err
+	}
+	scheme.AddKnownTypes(SchemeGroupVersion,
 		&Pod{},
 		&PodList{},
 		&PodStatusResult{},
@@ -35,8 +82,11 @@ func init() {
 		&ReplicationController{},
 		&ServiceList{},
 		&Service{},
+		&ServiceProxyOptions{},
 		&NodeList{},
 		&Node{},
+		&NodeConfigSource{},
+		&NodeProxyOptions{},
 		&Endpoints{},
 		&EndpointsList{},
 		&Binding{},
@@ -57,60 +107,18 @@ func init() {
 		&PersistentVolumeList{},
 		&PersistentVolumeClaim{},
 		&PersistentVolumeClaimList{},
-		&DeleteOptions{},
-		&ListOptions{},
 		&PodAttachOptions{},
 		&PodLogOptions{},
 		&PodExecOptions{},
+		&PodPortForwardOptions{},
 		&PodProxyOptions{},
 		&ComponentStatus{},
 		&ComponentStatusList{},
 		&SerializedReference{},
 		&RangeAllocation{},
+		&ConfigMap{},
+		&ConfigMapList{},
 	)
 
-	// Register Unversioned types
-	Scheme.AddKnownTypes("", &unversioned.Status{})
+	return nil
 }
-
-func (*Pod) IsAnAPIObject()                       {}
-func (*PodList) IsAnAPIObject()                   {}
-func (*PodStatusResult) IsAnAPIObject()           {}
-func (*PodTemplate) IsAnAPIObject()               {}
-func (*PodTemplateList) IsAnAPIObject()           {}
-func (*ReplicationController) IsAnAPIObject()     {}
-func (*ReplicationControllerList) IsAnAPIObject() {}
-func (*Service) IsAnAPIObject()                   {}
-func (*ServiceList) IsAnAPIObject()               {}
-func (*Endpoints) IsAnAPIObject()                 {}
-func (*EndpointsList) IsAnAPIObject()             {}
-func (*Node) IsAnAPIObject()                      {}
-func (*NodeList) IsAnAPIObject()                  {}
-func (*Binding) IsAnAPIObject()                   {}
-func (*Event) IsAnAPIObject()                     {}
-func (*EventList) IsAnAPIObject()                 {}
-func (*List) IsAnAPIObject()                      {}
-func (*LimitRange) IsAnAPIObject()                {}
-func (*LimitRangeList) IsAnAPIObject()            {}
-func (*ResourceQuota) IsAnAPIObject()             {}
-func (*ResourceQuotaList) IsAnAPIObject()         {}
-func (*Namespace) IsAnAPIObject()                 {}
-func (*NamespaceList) IsAnAPIObject()             {}
-func (*ServiceAccount) IsAnAPIObject()            {}
-func (*ServiceAccountList) IsAnAPIObject()        {}
-func (*Secret) IsAnAPIObject()                    {}
-func (*SecretList) IsAnAPIObject()                {}
-func (*PersistentVolume) IsAnAPIObject()          {}
-func (*PersistentVolumeList) IsAnAPIObject()      {}
-func (*PersistentVolumeClaim) IsAnAPIObject()     {}
-func (*PersistentVolumeClaimList) IsAnAPIObject() {}
-func (*DeleteOptions) IsAnAPIObject()             {}
-func (*ListOptions) IsAnAPIObject()               {}
-func (*PodAttachOptions) IsAnAPIObject()          {}
-func (*PodLogOptions) IsAnAPIObject()             {}
-func (*PodExecOptions) IsAnAPIObject()            {}
-func (*PodProxyOptions) IsAnAPIObject()           {}
-func (*ComponentStatus) IsAnAPIObject()           {}
-func (*ComponentStatusList) IsAnAPIObject()       {}
-func (*SerializedReference) IsAnAPIObject()       {}
-func (*RangeAllocation) IsAnAPIObject()           {}

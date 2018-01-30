@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package http
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -29,81 +30,135 @@ import (
 	"k8s.io/kubernetes/pkg/probe"
 )
 
-func containsAny(s string, substrs []string) bool {
-	for _, substr := range substrs {
-		if strings.Contains(s, substr) {
-			return true
-		}
-	}
-	return false
-}
+const FailureCode int = -1
 
 func TestHTTPProbeChecker(t *testing.T) {
-	handleReq := func(s int, body string) func(w http.ResponseWriter) {
-		return func(w http.ResponseWriter) {
+	handleReq := func(s int, body string) func(w http.ResponseWriter, r *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(s)
 			w.Write([]byte(body))
 		}
 	}
 
+	// Echo handler that returns the contents of request headers in the body
+	headerEchoHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		output := ""
+		for k, arr := range r.Header {
+			for _, v := range arr {
+				output += fmt.Sprintf("%s: %s\n", k, v)
+			}
+		}
+		w.Write([]byte(output))
+	}
+
 	prober := New()
 	testCases := []struct {
-		handler func(w http.ResponseWriter)
-		health  probe.Result
-		// go1.5: error message changed for timeout, need to support
-		// both old and new
-		accBodies []string
+		handler    func(w http.ResponseWriter, r *http.Request)
+		reqHeaders http.Header
+		health     probe.Result
+		accBody    string
+		notBody    string
 	}{
 		// The probe will be filled in below.  This is primarily testing that an HTTP GET happens.
 		{
-			handleReq(http.StatusOK, "ok body"),
-			probe.Success,
-			[]string{"ok body"},
+			handler: handleReq(http.StatusOK, "ok body"),
+			health:  probe.Success,
+			accBody: "ok body",
 		},
 		{
-			handleReq(-1, "fail body"),
-			probe.Failure,
-			[]string{"fail body"},
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"X-Muffins-Or-Cupcakes": {"muffins"},
+			},
+			health:  probe.Success,
+			accBody: "X-Muffins-Or-Cupcakes: muffins",
 		},
 		{
-			func(w http.ResponseWriter) {
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+			},
+			health:  probe.Success,
+			accBody: "User-Agent: foo/1.0",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {""},
+			},
+			health:  probe.Success,
+			notBody: "User-Agent",
+		},
+		{
+			handler:    headerEchoHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "User-Agent: kube-probe/",
+		},
+		{
+			// Echo handler that returns the contents of Host in the body
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+				w.Write([]byte(r.Host))
+			},
+			reqHeaders: http.Header{
+				"Host": {"muffins.cupcakes.org"},
+			},
+			health:  probe.Success,
+			accBody: "muffins.cupcakes.org",
+		},
+		{
+			handler: handleReq(FailureCode, "fail body"),
+			health:  probe.Failure,
+		},
+		{
+			handler: handleReq(http.StatusInternalServerError, "fail body"),
+			health:  probe.Failure,
+		},
+		{
+			handler: func(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(3 * time.Second)
 			},
-			probe.Failure,
-			[]string{
-				"use of closed network connection",
-				"request canceled (Client.Timeout exceeded while awaiting headers)",
-			},
+			health: probe.Failure,
 		},
 	}
-	for _, test := range testCases {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			test.handler(w)
-		}))
-		u, err := url.Parse(server.URL)
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-		_, port, err := net.SplitHostPort(u.Host)
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-		_, err = strconv.Atoi(port)
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-		health, output, err := prober.Probe(u, 1*time.Second)
-		if test.health == probe.Unknown && err == nil {
-			t.Errorf("Expected error")
-		}
-		if test.health != probe.Unknown && err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-		if health != test.health {
-			t.Errorf("Expected %v, got %v", test.health, health)
-		}
-		if !containsAny(output, test.accBodies) {
-			t.Errorf("Expected one of %#v, got %v", test.accBodies, output)
-		}
+	for i, test := range testCases {
+		func() {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				test.handler(w, r)
+			}))
+			defer server.Close()
+			u, err := url.Parse(server.URL)
+			if err != nil {
+				t.Errorf("case %d: unexpected error: %v", i, err)
+			}
+			_, port, err := net.SplitHostPort(u.Host)
+			if err != nil {
+				t.Errorf("case %d: unexpected error: %v", i, err)
+			}
+			_, err = strconv.Atoi(port)
+			if err != nil {
+				t.Errorf("case %d: unexpected error: %v", i, err)
+			}
+			health, output, err := prober.Probe(u, test.reqHeaders, 1*time.Second)
+			if test.health == probe.Unknown && err == nil {
+				t.Errorf("case %d: expected error", i)
+			}
+			if test.health != probe.Unknown && err != nil {
+				t.Errorf("case %d: unexpected error: %v", i, err)
+			}
+			if health != test.health {
+				t.Errorf("case %d: expected %v, got %v", i, test.health, health)
+			}
+			if health != probe.Failure && test.health != probe.Failure {
+				if !strings.Contains(output, test.accBody) {
+					t.Errorf("Expected response body to contain %v, got %v", test.accBody, output)
+				}
+				if test.notBody != "" && strings.Contains(output, test.notBody) {
+					t.Errorf("Expected response not to contain %v, got %v", test.notBody, output)
+				}
+			}
+		}()
 	}
 }

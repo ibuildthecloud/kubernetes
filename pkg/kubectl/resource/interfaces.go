@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ limitations under the License.
 package resource
 
 import (
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/meta"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/types"
+	client "k8s.io/client-go/rest"
 )
 
 // RESTClient is a client helper for dealing with RESTful resources
@@ -27,12 +27,12 @@ import (
 type RESTClient interface {
 	Get() *client.Request
 	Post() *client.Request
-	Patch(api.PatchType) *client.Request
+	Patch(types.PatchType) *client.Request
 	Delete() *client.Request
 	Put() *client.Request
 }
 
-// ClientMapper retrieves a client object for a given mapping
+// ClientMapper abstracts retrieving a Client for mapped objects.
 type ClientMapper interface {
 	ClientForMapping(mapping *meta.RESTMapping) (RESTClient, error)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package ovirt_cloud
+package ovirt
 
 import (
 	"encoding/xml"
@@ -29,9 +29,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/scalingdata/gcfg"
-	"k8s.io/kubernetes/pkg/api"
+	"gopkg.in/gcfg.v1"
+
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubernetes/pkg/cloudprovider"
+	"k8s.io/kubernetes/pkg/controller"
 )
 
 const ProviderName = "ovirt"
@@ -114,7 +117,10 @@ func newOVirtCloud(config io.Reader) (*OVirtCloud, error) {
 	return &OVirtCloud{VmsRequest: request}, nil
 }
 
-func (aws *OVirtCloud) Clusters() (cloudprovider.Clusters, bool) {
+// Initialize passes a Kubernetes clientBuilder interface to the cloud provider
+func (v *OVirtCloud) Initialize(clientBuilder controller.ControllerClientBuilder) {}
+
+func (v *OVirtCloud) Clusters() (cloudprovider.Clusters, bool) {
 	return nil, false
 }
 
@@ -123,8 +129,18 @@ func (v *OVirtCloud) ProviderName() string {
 	return ProviderName
 }
 
-// TCPLoadBalancer returns an implementation of TCPLoadBalancer for oVirt cloud
-func (v *OVirtCloud) TCPLoadBalancer() (cloudprovider.TCPLoadBalancer, bool) {
+// ScrubDNS filters DNS settings for pods.
+func (v *OVirtCloud) ScrubDNS(nameservers, searches []string) (nsOut, srchOut []string) {
+	return nameservers, searches
+}
+
+// HasClusterID returns true if the cluster has a clusterID
+func (v *OVirtCloud) HasClusterID() bool {
+	return true
+}
+
+// LoadBalancer returns an implementation of LoadBalancer for oVirt cloud
+func (v *OVirtCloud) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 	return nil, false
 }
 
@@ -143,8 +159,9 @@ func (v *OVirtCloud) Routes() (cloudprovider.Routes, bool) {
 	return nil, false
 }
 
-// NodeAddresses returns the NodeAddresses of a particular machine instance
-func (v *OVirtCloud) NodeAddresses(name string) ([]api.NodeAddress, error) {
+// NodeAddresses returns the NodeAddresses of the instance with the specified nodeName.
+func (v *OVirtCloud) NodeAddresses(nodeName types.NodeName) ([]v1.NodeAddress, error) {
+	name := mapNodeNameToInstanceName(nodeName)
 	instance, err := v.fetchInstance(name)
 	if err != nil {
 		return nil, err
@@ -165,11 +182,28 @@ func (v *OVirtCloud) NodeAddresses(name string) ([]api.NodeAddress, error) {
 		address = resolved[0]
 	}
 
-	return []api.NodeAddress{{Type: api.NodeLegacyHostIP, Address: address.String()}}, nil
+	return []v1.NodeAddress{
+		{Type: v1.NodeInternalIP, Address: address.String()},
+		{Type: v1.NodeExternalIP, Address: address.String()},
+	}, nil
 }
 
-// ExternalID returns the cloud provider ID of the specified instance (deprecated).
-func (v *OVirtCloud) ExternalID(name string) (string, error) {
+// NodeAddressesByProviderID returns the node addresses of an instances with the specified unique providerID
+// This method will not be called from the node that is requesting this ID. i.e. metadata service
+// and other local methods cannot be used here
+func (v *OVirtCloud) NodeAddressesByProviderID(providerID string) ([]v1.NodeAddress, error) {
+	return []v1.NodeAddress{}, errors.New("unimplemented")
+}
+
+// mapNodeNameToInstanceName maps from a k8s NodeName to an ovirt instance name (the hostname)
+// This is a simple string cast
+func mapNodeNameToInstanceName(nodeName types.NodeName) string {
+	return string(nodeName)
+}
+
+// ExternalID returns the cloud provider ID of the specified node with the specified NodeName (deprecated).
+func (v *OVirtCloud) ExternalID(nodeName types.NodeName) (string, error) {
+	name := mapNodeNameToInstanceName(nodeName)
 	instance, err := v.fetchInstance(name)
 	if err != nil {
 		return "", err
@@ -177,8 +211,15 @@ func (v *OVirtCloud) ExternalID(name string) (string, error) {
 	return instance.UUID, nil
 }
 
-// InstanceID returns the cloud provider ID of the specified instance.
-func (v *OVirtCloud) InstanceID(name string) (string, error) {
+// InstanceExistsByProviderID returns true if the instance with the given provider id still exists and is running.
+// If false is returned with no error, the instance will be immediately deleted by the cloud controller manager.
+func (v *OVirtCloud) InstanceExistsByProviderID(providerID string) (bool, error) {
+	return false, errors.New("unimplemented")
+}
+
+// InstanceID returns the cloud provider ID of the node with the specified NodeName.
+func (v *OVirtCloud) InstanceID(nodeName types.NodeName) (string, error) {
+	name := mapNodeNameToInstanceName(nodeName)
 	instance, err := v.fetchInstance(name)
 	if err != nil {
 		return "", err
@@ -186,6 +227,18 @@ func (v *OVirtCloud) InstanceID(name string) (string, error) {
 	// TODO: define a way to identify the provider instance to complete
 	// the format <provider_instance_id>/<instance_id>.
 	return "/" + instance.UUID, err
+}
+
+// InstanceTypeByProviderID returns the cloudprovider instance type of the node with the specified unique providerID
+// This method will not be called from the node that is requesting this ID. i.e. metadata service
+// and other local methods cannot be used here
+func (v *OVirtCloud) InstanceTypeByProviderID(providerID string) (string, error) {
+	return "", errors.New("unimplemented")
+}
+
+// InstanceType returns the type of the specified instance.
+func (v *OVirtCloud) InstanceType(name types.NodeName) (string, error) {
+	return "", nil
 }
 
 func getInstancesFromXml(body io.Reader) (OVirtInstanceMap, error) {
@@ -262,18 +315,9 @@ func (m *OVirtInstanceMap) ListSortedNames() []string {
 	return names
 }
 
-// List enumerates the set of minions instances known by the cloud provider
-func (v *OVirtCloud) List(filter string) ([]string, error) {
-	instances, err := v.fetchAllInstances()
-	if err != nil {
-		return nil, err
-	}
-	return instances.ListSortedNames(), nil
-}
-
 // Implementation of Instances.CurrentNodeName
-func (v *OVirtCloud) CurrentNodeName(hostname string) (string, error) {
-	return hostname, nil
+func (v *OVirtCloud) CurrentNodeName(hostname string) (types.NodeName, error) {
+	return types.NodeName(hostname), nil
 }
 
 func (v *OVirtCloud) AddSSHKeyToAllInstances(user string, keyData []byte) error {

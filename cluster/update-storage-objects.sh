@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 # they are written using the latest API version.
 #
 # Steps to use this script to upgrade the cluster to a new version:
-# https://github.com/kubernetes/kubernetes/blob/master/docs/cluster_management.md#updgrading-to-a-different-api-version
+# https://kubernetes.io/docs/tasks/administer-cluster/cluster-management/#upgrading-to-a-different-api-version
 
 set -o errexit
 set -o nounset
@@ -46,6 +46,9 @@ declare -a resources=(
     "resourcequotas"
     "secrets"
     "services"
+    "jobs"
+    "horizontalpodautoscalers"
+    "storageclasses"
 )
 
 # Find all the namespaces.
@@ -55,11 +58,25 @@ then
   echo "Unexpected: No namespace found. Nothing to do."
   exit 1
 fi
+
+all_failed=1
+
 for resource in "${resources[@]}"
 do
   for namespace in "${namespaces[@]}"
   do
+    # If get fails, assume it's because the resource hasn't been installed in the apiserver.
+    # TODO hopefully we can remove this once we use dynamic discovery of gettable/updateable
+    # resources.
+    set +e
     instances=( $("${KUBECTL}" get "${resource}" --namespace="${namespace}" -o go-template="{{range.items}}{{.metadata.name}} {{end}}"))
+    result=$?
+    set -e
+
+    if [[ "${all_failed}" -eq 1 && "${result}" -eq 0 ]]; then
+      all_failed=0
+    fi
+
     # Nothing to do if there is no instance of that resource.
     if [[ -z "${instances:-}" ]]
     then
@@ -106,6 +123,11 @@ do
     fi
   done
 done
+
+if [[ "${all_failed}" -eq 1 ]]; then
+  echo "kubectl get failed for all resources"
+  exit 1
+fi
 
 echo "All objects updated successfully!!"
 

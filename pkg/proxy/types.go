@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,16 +19,11 @@ package proxy
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // ProxyProvider is the interface provided by proxier implementations.
 type ProxyProvider interface {
-	// OnServiceUpdate manages the active set of service proxies.
-	// Active service proxies are reinitialized if found in the update set or
-	// removed if missing from the update set.
-	OnServiceUpdate(services []api.Service)
 	// Sync immediately synchronizes the ProxyProvider's current state to iptables.
 	Sync()
 	// SyncLoop runs periodic work.

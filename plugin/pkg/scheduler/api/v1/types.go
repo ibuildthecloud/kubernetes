@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,14 +16,29 @@ limitations under the License.
 
 package v1
 
-import "k8s.io/kubernetes/pkg/api/unversioned"
+import (
+	"time"
+
+	apiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	restclient "k8s.io/client-go/rest"
+)
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 type Policy struct {
-	unversioned.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
 	// Holds the information to configure the fit predicate functions
 	Predicates []PredicatePolicy `json:"predicates"`
 	// Holds the information to configure the priority functions
 	Priorities []PriorityPolicy `json:"priorities"`
+	// Holds the information to communicate with the extender(s)
+	ExtenderConfigs []ExtenderConfig `json:"extenders"`
+	// RequiredDuringScheduling affinity is not symmetric, but there is an implicit PreferredDuringScheduling affinity rule
+	// corresponding to every RequiredDuringScheduling affinity rule.
+	// HardPodAffinitySymmetricWeight represents the weight of implicit PreferredDuringScheduling affinity rule, in the range 1-100.
+	HardPodAffinitySymmetricWeight int `json:"hardPodAffinitySymmetricWeight"`
 }
 
 type PredicatePolicy struct {
@@ -99,4 +114,106 @@ type LabelPreference struct {
 	// If true, higher priority is given to nodes that have the label
 	// If false, higher priority is given to nodes that do not have the label
 	Presence bool `json:"presence"`
+}
+
+// Holds the parameters used to communicate with the extender. If a verb is unspecified/empty,
+// it is assumed that the extender chose not to provide that extension.
+type ExtenderConfig struct {
+	// URLPrefix at which the extender is available
+	URLPrefix string `json:"urlPrefix"`
+	// Verb for the filter call, empty if not supported. This verb is appended to the URLPrefix when issuing the filter call to extender.
+	FilterVerb string `json:"filterVerb,omitempty"`
+	// Verb for the prioritize call, empty if not supported. This verb is appended to the URLPrefix when issuing the prioritize call to extender.
+	PrioritizeVerb string `json:"prioritizeVerb,omitempty"`
+	// The numeric multiplier for the node scores that the prioritize call generates.
+	// The weight should be a positive integer
+	Weight int `json:"weight,omitempty"`
+	// Verb for the bind call, empty if not supported. This verb is appended to the URLPrefix when issuing the bind call to extender.
+	// If this method is implemented by the extender, it is the extender's responsibility to bind the pod to apiserver. Only one extender
+	// can implement this function.
+	BindVerb string
+	// EnableHttps specifies whether https should be used to communicate with the extender
+	EnableHttps bool `json:"enableHttps,omitempty"`
+	// TLSConfig specifies the transport layer security config
+	TLSConfig *restclient.TLSClientConfig `json:"tlsConfig,omitempty"`
+	// HTTPTimeout specifies the timeout duration for a call to the extender. Filter timeout fails the scheduling of the pod. Prioritize
+	// timeout is ignored, k8s/other extenders priorities are used to select the node.
+	HTTPTimeout time.Duration `json:"httpTimeout,omitempty"`
+	// NodeCacheCapable specifies that the extender is capable of caching node information,
+	// so the scheduler should only send minimal information about the eligible nodes
+	// assuming that the extender already cached full details of all nodes in the cluster
+	NodeCacheCapable bool `json:"nodeCacheCapable,omitempty"`
+}
+
+// ExtenderArgs represents the arguments needed by the extender to filter/prioritize
+// nodes for a pod.
+type ExtenderArgs struct {
+	// Pod being scheduled
+	Pod apiv1.Pod `json:"pod"`
+	// List of candidate nodes where the pod can be scheduled; to be populated
+	// only if ExtenderConfig.NodeCacheCapable == false
+	Nodes *apiv1.NodeList `json:"nodes,omitempty"`
+	// List of candidate node names where the pod can be scheduled; to be
+	// populated only if ExtenderConfig.NodeCacheCapable == true
+	NodeNames *[]string `json:"nodenames,omitempty"`
+}
+
+// FailedNodesMap represents the filtered out nodes, with node names and failure messages
+type FailedNodesMap map[string]string
+
+// ExtenderFilterResult represents the results of a filter call to an extender
+type ExtenderFilterResult struct {
+	// Filtered set of nodes where the pod can be scheduled; to be populated
+	// only if ExtenderConfig.NodeCacheCapable == false
+	Nodes *apiv1.NodeList `json:"nodes,omitempty"`
+	// Filtered set of nodes where the pod can be scheduled; to be populated
+	// only if ExtenderConfig.NodeCacheCapable == true
+	NodeNames *[]string `json:"nodenames,omitempty"`
+	// Filtered out nodes where the pod can't be scheduled and the failure messages
+	FailedNodes FailedNodesMap `json:"failedNodes,omitempty"`
+	// Error message indicating failure
+	Error string `json:"error,omitempty"`
+}
+
+// ExtenderBindingArgs represents the arguments to an extender for binding a pod to a node.
+type ExtenderBindingArgs struct {
+	// PodName is the name of the pod being bound
+	PodName string
+	// PodNamespace is the namespace of the pod being bound
+	PodNamespace string
+	// PodUID is the UID of the pod being bound
+	PodUID types.UID
+	// Node selected by the scheduler
+	Node string
+}
+
+// ExtenderBindingResult represents the result of binding of a pod to a node from an extender.
+type ExtenderBindingResult struct {
+	// Error message indicating failure
+	Error string
+}
+
+// HostPriority represents the priority of scheduling to a particular host, higher priority is better.
+type HostPriority struct {
+	// Name of the host
+	Host string `json:"host"`
+	// Score associated with the host
+	Score int `json:"score"`
+}
+
+type HostPriorityList []HostPriority
+
+func (h HostPriorityList) Len() int {
+	return len(h)
+}
+
+func (h HostPriorityList) Less(i, j int) bool {
+	if h[i].Score == h[j].Score {
+		return h[i].Host < h[j].Host
+	}
+	return h[i].Score < h[j].Score
+}
+
+func (h HostPriorityList) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
 }

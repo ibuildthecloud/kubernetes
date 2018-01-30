@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,25 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/cmd/km/kube-apiserver.go
 package main
 
 import (
-	kubeapiserver "k8s.io/kubernetes/cmd/kube-apiserver/app"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 )
 
 // NewKubeAPIServer creates a new hyperkube Server object that includes the
 // description and flags.
 func NewKubeAPIServer() *Server {
-	s := kubeapiserver.NewAPIServer()
+	s := options.NewServerRunOptions()
 
 	hks := Server{
-		SimpleUsage: "apiserver",
-		Long:        "The main API entrypoint and interface to the storage system.  The API server is also the focal point for all authorization decisions.",
-		Run: func(_ *Server, args []string) error {
-			return s.Run(args)
+		name:            "apiserver",
+		AlternativeName: "kube-apiserver",
+		SimpleUsage:     "apiserver",
+		Long:            "The main API entrypoint and interface to the storage system.  The API server is also the focal point for all authorization decisions.",
+		Run: func(_ *Server, args []string, stopCh <-chan struct{}) error {
+			return app.Run(s, stopCh)
 		},
+		RespectsStopCh: true,
 	}
 	s.AddFlags(hks.Flags())
 	return &hks

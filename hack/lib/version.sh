@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,6 +36,19 @@ kube::version::get_version_vars() {
     return
   fi
 
+  # If the kubernetes source was exported through git archive, then
+  # we likely don't have a git tree, but these magic values may be filled in.
+  if [[ '$Format:%%$' == "%" ]]; then
+    KUBE_GIT_COMMIT='$Format:%H$'
+    KUBE_GIT_TREE_STATE="git archive"
+    # When a 'git archive' is exported, the '$Format:%D$' below will look
+    # something like 'HEAD -> release-1.8, tag: v1.8.3' where then 'tag: '
+    # can be extracted from it.
+    if [[ '$Format:%D$' =~ tag:\ (v[^ ]+) ]]; then
+     KUBE_GIT_VERSION="${BASH_REMATCH[1]}"
+    fi
+  fi
+
   local git=(git --work-tree "${KUBE_ROOT}")
 
   if [[ -n ${KUBE_GIT_COMMIT-} ]] || KUBE_GIT_COMMIT=$("${git[@]}" rev-parse "HEAD^{commit}" 2>/dev/null); then
@@ -56,7 +69,14 @@ kube::version::get_version_vars() {
       #
       # TODO: We continue calling this "git version" because so many
       # downstream consumers are expecting it there.
-      KUBE_GIT_VERSION=$(echo "${KUBE_GIT_VERSION}" | sed "s/-\([0-9]\{1,\}\)-g\([0-9a-f]\{14\}\)$/.\1\+\2/")
+      DASHES_IN_VERSION=$(echo "${KUBE_GIT_VERSION}" | sed "s/[^-]//g")
+      if [[ "${DASHES_IN_VERSION}" == "---" ]] ; then
+        # We have distance to subversion (v1.1.0-subversion-1-gCommitHash)
+        KUBE_GIT_VERSION=$(echo "${KUBE_GIT_VERSION}" | sed "s/-\([0-9]\{1,\}\)-g\([0-9a-f]\{14\}\)$/.\1\+\2/")
+      elif [[ "${DASHES_IN_VERSION}" == "--" ]] ; then
+        # We have distance to base tag (v1.1.0-1-gCommitHash)
+        KUBE_GIT_VERSION=$(echo "${KUBE_GIT_VERSION}" | sed "s/-g\([0-9a-f]\{14\}\)$/+\1/")
+      fi
       if [[ "${KUBE_GIT_TREE_STATE}" == "dirty" ]]; then
         # git describe --dirty only considers changes to existing files, but
         # that is problematic since new untracked .go files affect the build,
@@ -107,26 +127,25 @@ kube::version::load_version_vars() {
   source "${version_file}"
 }
 
-# golang 1.5 wants `-X key=val`, but golang 1.4- REQUIRES `-X key val`
 kube::version::ldflag() {
   local key=${1}
   local val=${2}
 
-  GO_VERSION=($(go version))
-
-  if [[ -z $(echo "${GO_VERSION[2]}" | grep -E 'go1.5') ]]; then
-    echo "-X ${KUBE_GO_PACKAGE}/pkg/version.${key} ${val}"
-  else
-    echo "-X ${KUBE_GO_PACKAGE}/pkg/version.${key}=${val}"
-  fi
+  # If you update these, also update the list pkg/version/def.bzl.
+  echo "-X ${KUBE_GO_PACKAGE}/pkg/version.${key}=${val}"
+  echo "-X ${KUBE_GO_PACKAGE}/vendor/k8s.io/client-go/pkg/version.${key}=${val}"
 }
 
 # Prints the value that needs to be passed to the -ldflags parameter of go build
 # in order to set the Kubernetes based on the git tree status.
+# IMPORTANT: if you update any of these, also update the lists in
+# pkg/version/def.bzl and hack/print-workspace-status.sh.
 kube::version::ldflags() {
   kube::version::get_version_vars
 
-  local -a ldflags=()
+  local buildDate=
+  [[ -z ${SOURCE_DATE_EPOCH-} ]] || buildDate="--date=@${SOURCE_DATE_EPOCH}"
+  local -a ldflags=($(kube::version::ldflag "buildDate" "$(date ${buildDate} -u +'%Y-%m-%dT%H:%M:%SZ')"))
   if [[ -n ${KUBE_GIT_COMMIT-} ]]; then
     ldflags+=($(kube::version::ldflag "gitCommit" "${KUBE_GIT_COMMIT}"))
     ldflags+=($(kube::version::ldflag "gitTreeState" "${KUBE_GIT_TREE_STATE}"))

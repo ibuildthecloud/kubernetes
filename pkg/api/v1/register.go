@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2017 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,115 +17,30 @@ limitations under the License.
 package v1
 
 import (
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/registered"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Codec encodes internal objects to the v1 scheme
-var Codec = runtime.CodecFor(api.Scheme, "v1")
+var (
+	localSchemeBuilder = &v1.SchemeBuilder
+	AddToScheme        = localSchemeBuilder.AddToScheme
+)
 
 func init() {
-	// Check if v1 is in the list of supported API versions.
-	if !registered.IsRegisteredAPIVersion("v1") {
-		return
-	}
-
-	// Register the API.
-	addKnownTypes()
-	addConversionFuncs()
-	addDefaultingFuncs()
+	// We only register manually written functions here. The registration of the
+	// generated functions takes place in the generated files. The separation
+	// makes the code compile even when the generated files are missing.
+	localSchemeBuilder.Register(addDefaultingFuncs, addConversionFuncs, addFastPathConversionFuncs)
 }
 
-// Adds the list of known types to api.Scheme.
-func addKnownTypes() {
-	api.Scheme.AddKnownTypes("v1",
-		&Pod{},
-		&PodList{},
-		&PodStatusResult{},
-		&PodTemplate{},
-		&PodTemplateList{},
-		&ReplicationController{},
-		&ReplicationControllerList{},
-		&Service{},
-		&ServiceList{},
-		&Endpoints{},
-		&EndpointsList{},
-		&Node{},
-		&NodeList{},
-		&Binding{},
-		&Event{},
-		&EventList{},
-		&List{},
-		&LimitRange{},
-		&LimitRangeList{},
-		&ResourceQuota{},
-		&ResourceQuotaList{},
-		&Namespace{},
-		&NamespaceList{},
-		&Secret{},
-		&SecretList{},
-		&ServiceAccount{},
-		&ServiceAccountList{},
-		&PersistentVolume{},
-		&PersistentVolumeList{},
-		&PersistentVolumeClaim{},
-		&PersistentVolumeClaimList{},
-		&DeleteOptions{},
-		&ListOptions{},
-		&PodAttachOptions{},
-		&PodLogOptions{},
-		&PodExecOptions{},
-		&PodProxyOptions{},
-		&ComponentStatus{},
-		&ComponentStatusList{},
-		&SerializedReference{},
-		&RangeAllocation{},
-	)
+// TODO: remove these global varialbes
+// GroupName is the group name use in this package
+const GroupName = ""
 
-	// Add common types
-	api.Scheme.AddKnownTypes("v1", &unversioned.Status{})
+// SchemeGroupVersion is group version used to register these objects
+var SchemeGroupVersion = schema.GroupVersion{Group: GroupName, Version: "v1"}
+
+// Resource takes an unqualified resource and returns a Group qualified GroupResource
+func Resource(resource string) schema.GroupResource {
+	return SchemeGroupVersion.WithResource(resource).GroupResource()
 }
-
-func (*Pod) IsAnAPIObject()                       {}
-func (*PodList) IsAnAPIObject()                   {}
-func (*PodStatusResult) IsAnAPIObject()           {}
-func (*PodTemplate) IsAnAPIObject()               {}
-func (*PodTemplateList) IsAnAPIObject()           {}
-func (*ReplicationController) IsAnAPIObject()     {}
-func (*ReplicationControllerList) IsAnAPIObject() {}
-func (*Service) IsAnAPIObject()                   {}
-func (*ServiceList) IsAnAPIObject()               {}
-func (*Endpoints) IsAnAPIObject()                 {}
-func (*EndpointsList) IsAnAPIObject()             {}
-func (*Node) IsAnAPIObject()                      {}
-func (*NodeList) IsAnAPIObject()                  {}
-func (*Binding) IsAnAPIObject()                   {}
-func (*Event) IsAnAPIObject()                     {}
-func (*EventList) IsAnAPIObject()                 {}
-func (*List) IsAnAPIObject()                      {}
-func (*LimitRange) IsAnAPIObject()                {}
-func (*LimitRangeList) IsAnAPIObject()            {}
-func (*ResourceQuota) IsAnAPIObject()             {}
-func (*ResourceQuotaList) IsAnAPIObject()         {}
-func (*Namespace) IsAnAPIObject()                 {}
-func (*NamespaceList) IsAnAPIObject()             {}
-func (*Secret) IsAnAPIObject()                    {}
-func (*SecretList) IsAnAPIObject()                {}
-func (*ServiceAccount) IsAnAPIObject()            {}
-func (*ServiceAccountList) IsAnAPIObject()        {}
-func (*PersistentVolume) IsAnAPIObject()          {}
-func (*PersistentVolumeList) IsAnAPIObject()      {}
-func (*PersistentVolumeClaim) IsAnAPIObject()     {}
-func (*PersistentVolumeClaimList) IsAnAPIObject() {}
-func (*DeleteOptions) IsAnAPIObject()             {}
-func (*ListOptions) IsAnAPIObject()               {}
-func (*PodAttachOptions) IsAnAPIObject()          {}
-func (*PodLogOptions) IsAnAPIObject()             {}
-func (*PodExecOptions) IsAnAPIObject()            {}
-func (*PodProxyOptions) IsAnAPIObject()           {}
-func (*ComponentStatus) IsAnAPIObject()           {}
-func (*ComponentStatusList) IsAnAPIObject()       {}
-func (*SerializedReference) IsAnAPIObject()       {}
-func (*RangeAllocation) IsAnAPIObject()           {}

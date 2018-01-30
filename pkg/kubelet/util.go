@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,28 +18,29 @@ package kubelet
 
 import (
 	"fmt"
+	"os"
 
-	cadvisorApi "github.com/google/cadvisor/info/v1"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
+	"k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/capabilities"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/securitycontext"
 )
 
-func CapacityFromMachineInfo(info *cadvisorApi.MachineInfo) api.ResourceList {
-	c := api.ResourceList{
-		api.ResourceCPU: *resource.NewMilliQuantity(
-			int64(info.NumCores*1000),
-			resource.DecimalSI),
-		api.ResourceMemory: *resource.NewQuantity(
-			info.MemoryCapacity,
-			resource.BinarySI),
-	}
-	return c
-}
-
 // Check whether we have the capabilities to run the specified pod.
-func canRunPod(pod *api.Pod) error {
+func canRunPod(pod *v1.Pod) error {
+	if !capabilities.Get().AllowPrivileged {
+		for _, container := range pod.Spec.Containers {
+			if securitycontext.HasPrivilegedRequest(&container) {
+				return fmt.Errorf("pod with UID %q specified privileged container, but is disallowed", pod.UID)
+			}
+		}
+		for _, container := range pod.Spec.InitContainers {
+			if securitycontext.HasPrivilegedRequest(&container) {
+				return fmt.Errorf("pod with UID %q specified privileged init container, but is disallowed", pod.UID)
+			}
+		}
+	}
+
 	if pod.Spec.HostNetwork {
 		allowed, err := allowHostNetwork(pod)
 		if err != nil {
@@ -70,19 +71,12 @@ func canRunPod(pod *api.Pod) error {
 		}
 	}
 
-	if !capabilities.Get().AllowPrivileged {
-		for _, container := range pod.Spec.Containers {
-			if securitycontext.HasPrivilegedRequest(&container) {
-				return fmt.Errorf("pod with UID %q specified privileged container, but is disallowed", pod.UID)
-			}
-		}
-	}
 	return nil
 }
 
 // Determined whether the specified pod is allowed to use host networking
-func allowHostNetwork(pod *api.Pod) (bool, error) {
-	podSource, err := getPodSource(pod)
+func allowHostNetwork(pod *v1.Pod) (bool, error) {
+	podSource, err := kubetypes.GetPodSource(pod)
 	if err != nil {
 		return false, err
 	}
@@ -94,9 +88,9 @@ func allowHostNetwork(pod *api.Pod) (bool, error) {
 	return false, nil
 }
 
-// Determined whether the specified pod is allowed to use host networking
-func allowHostPID(pod *api.Pod) (bool, error) {
-	podSource, err := getPodSource(pod)
+// Determined whether the specified pod is allowed to use host PID
+func allowHostPID(pod *v1.Pod) (bool, error) {
+	podSource, err := kubetypes.GetPodSource(pod)
 	if err != nil {
 		return false, err
 	}
@@ -109,8 +103,8 @@ func allowHostPID(pod *api.Pod) (bool, error) {
 }
 
 // Determined whether the specified pod is allowed to use host ipc
-func allowHostIPC(pod *api.Pod) (bool, error) {
-	podSource, err := getPodSource(pod)
+func allowHostIPC(pod *v1.Pod) (bool, error) {
+	podSource, err := kubetypes.GetPodSource(pod)
 	if err != nil {
 		return false, err
 	}
@@ -121,3 +115,15 @@ func allowHostIPC(pod *api.Pod) (bool, error) {
 	}
 	return false, nil
 }
+
+// dirExists returns true if the path exists and represents a directory.
+func dirExists(path string) bool {
+	s, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return s.IsDir()
+}
+
+// empty is a placeholder type used to implement a set
+type empty struct{}

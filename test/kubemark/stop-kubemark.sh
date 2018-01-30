@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,28 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Script that destroys Kubemark clusters and deletes all GCE resources created for Master
+# Script that destroys Kubemark cluster and deletes all master resources.
+
 KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
 
-source "${KUBE_ROOT}/cluster/kubemark/config-default.sh"
+source "${KUBE_ROOT}/test/kubemark/skeleton/util.sh"
+source "${KUBE_ROOT}/test/kubemark/cloud-provider-config.sh"
+source "${KUBE_ROOT}/test/kubemark/${CLOUD_PROVIDER}/util.sh"
+source "${KUBE_ROOT}/cluster/kubemark/${CLOUD_PROVIDER}/config-default.sh"
 source "${KUBE_ROOT}/cluster/kubemark/util.sh"
+
+KUBECTL="${KUBE_ROOT}/cluster/kubectl.sh"
+KUBEMARK_DIRECTORY="${KUBE_ROOT}/test/kubemark"
+RESOURCE_DIRECTORY="${KUBEMARK_DIRECTORY}/resources"
 
 detect-project &> /dev/null
 
-MASTER_NAME="hollow-cluster-master"
+"${KUBECTL}" delete -f "${RESOURCE_DIRECTORY}/addons" &> /dev/null || true
+"${KUBECTL}" delete -f "${RESOURCE_DIRECTORY}/hollow-node.yaml" &> /dev/null || true
+"${KUBECTL}" delete -f "${RESOURCE_DIRECTORY}/kubemark-ns.json" &> /dev/null || true
 
-kubectl delete -f ${KUBE_ROOT}/test/kubemark/hollow-kubelet.json &> /dev/null || true
-kubectl delete -f ${KUBE_ROOT}/test/kubemark/kubemark-ns.json &> /dev/null || true
+rm -rf "${RESOURCE_DIRECTORY}/addons" \
+	"${RESOURCE_DIRECTORY}/kubeconfig.kubemark" \
+	"${RESOURCE_DIRECTORY}/hollow-node.yaml" \
+	"${RESOURCE_DIRECTORY}/kubemark-master-env.sh"  &> /dev/null || true
 
-gcloud compute instances delete "${MASTER_NAME}" \
-    --project "${PROJECT}" \
-    --quiet \
-    --zone "${ZONE}" || true
-
-gcloud compute disks delete \
-      --project "${PROJECT}" \
-      --quiet \
-      --zone "${ZONE}" \
-      "${MASTER_NAME}"-pd || true
-
-rm -rf "${KUBE_ROOT}/test/kubemark/kubeconfig.loc" &> /dev/null || true
+delete-master-instance-and-resources
