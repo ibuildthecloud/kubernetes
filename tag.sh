@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 if [ -z "$1" ]; then
     echo usage: $0 TAG
@@ -12,6 +13,7 @@ if [ -n "$(git tag -l $1)" ]; then
 fi
 
 rm -f ./pkg/generated/openapi/openapi.go
+rm -f ./pkg/generated/openapi/zz_generated.openapi.go
 
 ./hack/update-codegen.sh
 go run ./pkg/generated/openapi/gen/main.go > ./pkg/generated/openapi/gen/openapi.go
@@ -34,9 +36,14 @@ var (
 EOF
 done
 
-GO111MODULE=on go list -m all | grep -v ./staging | grep '=>' | sed 's/.*=>//' | awk '{print $1 " " $2}' | sed -e 's/+incompatible//' -e 's/ v.*-.*-\(.*\)$/ \1/g' > vendor.conf
-
-git add ./pkg/generated/openapi/openapi.go vendor.conf
+if [ "$(git diff ./pkg/generated/openapi/openapi.go | wc -l)" -gt 0 ]; then
+    git add ./pkg/generated/openapi/openapi.go
+fi
 git add $F
 git commit -m $1
 git tag $1
+for i in staging/src/k8s.io/*; do
+    git tag -d $i/$1 2>/dev/null || true
+    git tag $i/$1
+    echo git tag '$REMOTE' $i/$1
+done
