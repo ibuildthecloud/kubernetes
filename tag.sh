@@ -36,9 +36,7 @@ var (
 EOF
 done
 
-if [ "$(git diff ./pkg/generated/openapi/openapi.go | wc -l)" -gt 0 ]; then
-    git add ./pkg/generated/openapi/openapi.go
-fi
+git add ./pkg/generated/openapi/openapi.go 2>/dev/null || true
 git add $F
 git commit -m $1
 git tag $1
